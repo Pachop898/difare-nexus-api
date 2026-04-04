@@ -1,413 +1,738 @@
 """
-DIFARE NEXUS API con Autenticación
-Versión serverless para Vercel + Login seguro
+DIFARE NEXUS API v3 — Unificado
+Backend + Frontend servido desde Flask
+SQLite · JWT Auth · Vercel-ready
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import anthropic
-import pandas as pd
-import glob
+import sqlite3
 import os
-import threading
 import time
 import hashlib
+import hmac
+import json
+import base64
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={
-    r"/api/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]},
-    r"/*": {"origins": "*"}
-})
+CORS(app, resources={r"/*": {"origins": "*", "methods": ["GET", "POST", "OPTIONS"]}})
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-# ── USUARIOS Y CONTRASEÑAS (ENCRIPTADAS) ──
-# Puedes cambiar estos valores cuando quieras
+# ── CONFIG ──
+JWT_SECRET = os.getenv("JWT_SECRET", "difare-nexus-secret-cambiar-en-produccion")
+JWT_EXPIRY = 86400
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+
+# ── USUARIOS ──
+def _hash(pw):
+    return hashlib.sha256(pw.encode()).hexdigest()
+
 USUARIOS = {
-    "francisco": hashlib.sha256("pass123".encode()).hexdigest(),
-    "mercaderista1": hashlib.sha256("difare2026".encode()).hexdigest(),
-    "gerente_ventas": hashlib.sha256("ventas123".encode()).hexdigest(),
+    os.getenv("USER_1_NAME", "francisco"): _hash(os.getenv("USER_1_PASS", "admin123")),
+    os.getenv("USER_2_NAME", "Campo"):     _hash(os.getenv("USER_2_PASS", "markup123")),
+    os.getenv("USER_3_NAME", "Gerente"):   _hash(os.getenv("USER_3_PASS", "gerentes2026")),
 }
 
-# Tokens de sesión (simples, no production-grade)
-SESIONES_ACTIVAS = {}
 
-# ── CACHE GLOBAL ──
-_df_cache = None
-_cache_timestamp = None
-_cache_lock = threading.Lock()
-CACHE_EXPIRY = 3600
+# ══════════════════════════════════════════════════════════════
+# JWT (sin dependencias externas)
+# ══════════════════════════════════════════════════════════════
 
-def cargar_datos_async():
-    """Carga datos en background"""
-    global _df_cache, _cache_timestamp
-    with _cache_lock:
-        carpeta = "excels"
-        if not os.path.exists(carpeta):
-            carpeta = "./excels"
-        if not os.path.exists(carpeta):
-            carpeta = "../excels"
-        
-        archivos = [f for f in glob.glob(f"{carpeta}/*.xlsx") if "EJEMPLO" not in f.upper()]
-        if not archivos:
-            print(f"⚠️  Sin archivos en {carpeta}")
-            _df_cache = pd.DataFrame()
-            _cache_timestamp = time.time()
-            return
-        
-        dfs = []
-        print(f"📦 Cargando datos desde {carpeta}...")
-        for a in archivos:
-            try:
-                df = pd.read_excel(a)
-                if "FECHA" in df.columns and "DIA" not in df.columns:
-                    df["DIA"] = df["FECHA"].astype(str)
-                dfs.append(df)
-                print(f"  ✓ {os.path.basename(a)}: {len(df):,} filas")
-            except Exception as e:
-                print(f"  ✗ {os.path.basename(a)}: {e}")
-        
-        _df_cache = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
-        _cache_timestamp = time.time()
-        print(f"✅ Total: {len(_df_cache):,} filas cargadas\n")
+def _b64e(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
-def cargar_datos():
-    """Retorna datos cacheados con refresh automático"""
-    global _df_cache, _cache_timestamp
-    
-    if _df_cache is None:
-        cargar_datos_async()
-        return _df_cache
-    
-    if time.time() - _cache_timestamp > CACHE_EXPIRY:
-        threading.Thread(target=cargar_datos_async, daemon=True).start()
-    
-    return _df_cache
+def _b64d(s):
+    return base64.urlsafe_b64decode(s + "=" * (4 - len(s) % 4))
 
-def verificar_token(token):
-    """Verifica si un token es válido"""
-    return token in SESIONES_ACTIVAS and SESIONES_ACTIVAS[token] > time.time()
+def crear_jwt(usuario):
+    h = _b64e(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    p = _b64e(json.dumps({"sub": usuario, "exp": int(time.time()) + JWT_EXPIRY, "iat": int(time.time())}).encode())
+    s = hmac.new(JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+    return f"{h}.{p}.{_b64e(s)}"
 
-def parsear_mes_fecha(dia_str):
-    """Parsea fechas en múltiples formatos"""
+def verificar_jwt(token):
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        h, p, s = parts
+        expected = hmac.new(JWT_SECRET.encode(), f"{h}.{p}".encode(), hashlib.sha256).digest()
+        if _b64e(expected) != s:
+            return None
+        datos = json.loads(_b64d(p))
+        if datos.get("exp", 0) < time.time():
+            return None
+        return datos.get("sub")
+    except Exception:
+        return None
+
+def auth_user():
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    return verificar_jwt(token)
+
+
+# ══════════════════════════════════════════════════════════════
+# BASE DE DATOS (SQLite puro, sin pandas)
+# ══════════════════════════════════════════════════════════════
+
+def get_db():
+    """Retorna conexion SQLite (una por request)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def query(sql, params=(), one=False):
+    """Ejecuta query y retorna resultados como lista de dicts"""
+    conn = get_db()
+    try:
+        cur = conn.execute(sql, params)
+        rows = [dict(r) for r in cur.fetchall()]
+        return rows[0] if one and rows else rows if not one else None
+    finally:
+        conn.close()
+
+def query_val(sql, params=()):
+    """Retorna un solo valor"""
+    conn = get_db()
+    try:
+        return conn.execute(sql, params).fetchone()[0]
+    finally:
+        conn.close()
+
+def parsear_mes(dia_str):
     s = str(dia_str).strip()
     if "/" in s:
-        try:
-            return pd.to_datetime(s, format="%Y/%m/%d").to_period("M").strftime("%Y-%m")
-        except:
-            return "desconocido"
-    elif len(s) == 6 and s.isdigit():
+        parts = s.split("/")
+        if len(parts) == 3 and len(parts[0]) == 4:
+            return f"{parts[0]}-{parts[1]}"
+    if len(s) >= 7:
+        return s[:7]
+    if len(s) == 6 and s.isdigit():
         return s[:4] + "-" + s[4:6]
-    elif len(s) == 8 and s.isdigit():
-        try:
-            return pd.to_datetime(s, format="%Y%m%d").to_period("M").strftime("%Y-%m")
-        except:
-            return "desconocido"
-    else:
-        return s[:7] if len(s) >= 7 else "desconocido"
+    if len(s) == 8 and s.isdigit():
+        return s[:4] + "-" + s[4:6]
+    return "desconocido"
 
-def obtener_stock_pos(pos, df):
-    """Obtiene stock en tiempo real del SAP"""
-    sap_files = [f for f in glob.glob("excels/*.xlsx") if "SAP" in f.upper()]
-    if not sap_files:
-        sap_files = [f for f in glob.glob("./excels/*.xlsx") if "SAP" in f.upper()]
-    if not sap_files:
-        return {"mensaje": "SAP no disponible"}
-    
-    try:
-        df_sap = pd.read_excel(sap_files[0])
-        df_pos = df_sap[(df_sap["UNIDAD"]=="FARMACIAS") & (df_sap["POS"]==pos)]
-        if df_pos.empty:
-            return {"mensaje": "Sin registros en SAP"}
-        stock_por_dia = df_pos.groupby("DIA")["STOCK"].sum()
-        dias_con_stock = stock_por_dia[stock_por_dia > 0]
-        if dias_con_stock.empty:
-            return {"mensaje": "Sin stock registrado"}
-        ultimo_dia = dias_con_stock.index.max()
-        stock_dia = df_pos[df_pos["DIA"]==ultimo_dia][["PRODUCTO","STOCK","IDNEPTUNO"]].copy()
-        stock_dia = stock_dia.sort_values("STOCK", ascending=False)
-        return {
-            "fecha": str(ultimo_dia),
-            "total_productos": len(stock_dia),
-            "detalle_stock": stock_dia[["PRODUCTO","STOCK"]].to_dict("records")[:15],
-            "sin_stock": stock_dia[stock_dia["STOCK"]==0]["PRODUCTO"].tolist()[:5],
-            "bajo_stock": stock_dia[(stock_dia["STOCK"]>0) & (stock_dia["STOCK"]<=3)][["PRODUCTO","STOCK"]].to_dict("records")[:5],
-            "con_stock_ok": stock_dia[stock_dia["STOCK"]>3][["PRODUCTO","STOCK"]].to_dict("records")[:5]
-        }
-    except Exception as e:
-        return {"error": f"Error: {str(e)[:50]}"}
 
-# ── ENDPOINTS DE AUTENTICACIÓN ──
+# ══════════════════════════════════════════════════════════════
+# ENDPOINTS AUTH
+# ══════════════════════════════════════════════════════════════
 
 @app.route("/login", methods=["POST", "OPTIONS"])
 def login():
-    """Login con usuario y contraseña"""
     if request.method == "OPTIONS":
         return "", 204
-    
-    data = request.json
+    data = request.json or {}
     usuario = data.get("usuario", "").strip()
-    contraseña = data.get("contraseña", "").strip()
-    
-    if not usuario or not contraseña:
-        return jsonify({"error": "Usuario y contraseña requeridos"}), 400
-    
-    # Validar credenciales
-    if usuario not in USUARIOS:
-        return jsonify({"error": "Usuario no existe"}), 401
-    
-    # Comparar contraseña encriptada
-    contraseña_encriptada = hashlib.sha256(contraseña.encode()).hexdigest()
-    if USUARIOS[usuario] != contraseña_encriptada:
-        return jsonify({"error": "Contraseña incorrecta"}), 401
-    
-    # Generar token (válido por 24 horas)
-    token = hashlib.sha256(f"{usuario}{time.time()}".encode()).hexdigest()
-    SESIONES_ACTIVAS[token] = time.time() + 86400  # 24 horas
-    
-    return jsonify({
-        "exito": True,
-        "token": token,
-        "usuario": usuario,
-        "mensaje": f"Bienvenido {usuario}"
-    }), 200
+    contra = data.get("contrasena", data.get("contraseña", "")).strip()
+    if not usuario or not contra:
+        return jsonify({"error": "Usuario y contrasena requeridos"}), 400
+    if usuario not in USUARIOS or USUARIOS[usuario] != _hash(contra):
+        return jsonify({"error": "Credenciales invalidas"}), 401
+    return jsonify({"exito": True, "token": crear_jwt(usuario), "usuario": usuario, "mensaje": f"Bienvenido {usuario}"}), 200
+
+@app.route("/verificar_token", methods=["POST", "OPTIONS"])
+def verificar_token_endpoint():
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.json or {}
+    usuario = verificar_jwt(data.get("token", ""))
+    if usuario:
+        return jsonify({"valido": True, "usuario": usuario}), 200
+    return jsonify({"valido": False}), 401
 
 @app.route("/logout", methods=["POST"])
 def logout():
-    """Cerrar sesión"""
-    data = request.json
-    token = data.get("token", "")
-    
-    if token in SESIONES_ACTIVAS:
-        del SESIONES_ACTIVAS[token]
-    
-    return jsonify({"exito": True, "mensaje": "Sesión cerrada"}), 200
-
-@app.route("/verificar_token", methods=["POST"])
-def verificar_token_endpoint():
-    """Verificar si un token sigue siendo válido"""
-    data = request.json
-    token = data.get("token", "")
-    
-    if verificar_token(token):
-        return jsonify({"valido": True}), 200
-    else:
-        return jsonify({"valido": False}), 401
-
-# ── ENDPOINTS DEL CHAT (CON PROTECCIÓN) ──
+    return jsonify({"exito": True, "mensaje": "Sesion cerrada"}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "status": "ok",
-        "cache_loaded": _df_cache is not None,
-        "timestamp": time.time()
-    }), 200
+    try:
+        ventas = query_val("SELECT COUNT(*) FROM ventas")
+        sap = query_val("SELECT COUNT(*) FROM sap")
+        return jsonify({"status": "ok", "ventas": ventas, "sap": sap}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "detail": str(e)[:100]}), 500
+
+
+# ══════════════════════════════════════════════════════════════
+# ENDPOINTS DATOS
+# ══════════════════════════════════════════════════════════════
 
 @app.route("/grupos", methods=["GET"])
 def get_grupos():
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not verificar_token(token):
-        return jsonify({"error": "No autorizado. Token inválido o expirado."}), 401
-    
-    df = cargar_datos()
-    if df.empty:
-        return jsonify({"error": "Sin datos"}), 500
-    farm = df[df["UNIDAD"]=="FARMACIAS"]
-    grupos = farm.groupby("GRUPOPDV").agg(
-        ventas=("VENTA NETA RECUPERO","sum"),
-        pos_count=("POS","nunique")
-    ).reset_index().sort_values("ventas", ascending=False)
-    return jsonify([{
-        "grupo": r["GRUPOPDV"],
-        "ventas": round(float(r["ventas"]),2),
-        "total_pos": int(r["pos_count"])
-    } for _, r in grupos.iterrows()]), 200
+    if not auth_user():
+        return jsonify({"error": "No autorizado"}), 401
+
+    rows = query("""
+        SELECT GRUPOPDV,
+               SUM("VENTA NETA RECUPERO") as ventas,
+               COUNT(DISTINCT COALESCE(CODIGOPDV, POS)) as pos_count
+        FROM ventas WHERE UNIDAD='FARMACIAS'
+        GROUP BY GRUPOPDV ORDER BY ventas DESC
+    """)
+
+    mapeo = {
+        "cafi mostrador": "Cruz Azul Mostrador",
+        "cafa mostrador": "Cruz Azul Mostrador",
+        "cofa mostrador": "Cruz Azul Mostrador",
+        "cafi autoservicio": "Cruz Azul Autoservicio",
+        "cafa autoservicio": "Cruz Azul Autoservicio"
+    }
+
+    agrupados = {}
+    for r in rows:
+        nombre = mapeo.get(r["GRUPOPDV"].lower(), r["GRUPOPDV"])
+        if nombre not in agrupados:
+            agrupados[nombre] = {"ventas": 0, "pos_count": 0}
+        agrupados[nombre]["ventas"] += r["ventas"]
+        agrupados[nombre]["pos_count"] += r["pos_count"]
+
+    resultado = [{"grupo": k, "ventas": round(v["ventas"], 2), "total_pos": v["pos_count"]}
+                 for k, v in agrupados.items()]
+    resultado.sort(key=lambda x: x["ventas"], reverse=True)
+    return jsonify(resultado), 200
+
 
 @app.route("/farmacias/<grupo>", methods=["GET"])
 def get_farmacias_por_grupo(grupo):
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not verificar_token(token):
+    if not auth_user():
         return jsonify({"error": "No autorizado"}), 401
-    
-    df = cargar_datos()
-    if df.empty:
-        return jsonify({"error": "Sin datos"}), 500
-    farm = df[df["UNIDAD"]=="FARMACIAS"]
+
     grupo_decoded = grupo.replace("_", " ")
-    farm_grupo = farm[farm["GRUPOPDV"].str.lower() == grupo_decoded.lower()]
-    if farm_grupo.empty:
-        farm_grupo = farm[farm["GRUPOPDV"].str.lower().str.contains(grupo_decoded.lower(), na=False)]
-    por_pos = farm_grupo.groupby("POS").agg(
-        ventas=("VENTA NETA RECUPERO","sum"),
-        unidades=("UNIDADES_ROTADAS","sum")
-    ).reset_index().sort_values("ventas", ascending=False)
+    mapeo_inv = {
+        "Cruz Azul Mostrador": ("cafi mostrador", "cafa mostrador", "cofa mostrador"),
+        "Cruz Azul Autoservicio": ("cafi autoservicio", "cafa autoservicio"),
+    }
+
+    grupos = mapeo_inv.get(grupo_decoded, (grupo_decoded.lower(),))
+    placeholders = ",".join(["?" for _ in grupos])
+
+    rows = query(f"""
+        SELECT POS as pos_nombre,
+               COALESCE(CODIGOPDV, POS) as codigo,
+               SUM("VENTA NETA RECUPERO") as ventas,
+               SUM(UNIDADES_ROTADAS) as unidades
+        FROM ventas
+        WHERE UNIDAD='FARMACIAS' AND LOWER(GRUPOPDV) IN ({placeholders})
+        GROUP BY COALESCE(CODIGOPDV, POS)
+        ORDER BY ventas DESC
+    """, grupos)
+
+    if not rows:
+        rows = query("""
+            SELECT POS as pos_nombre, POS as codigo,
+                   SUM("VENTA NETA RECUPERO") as ventas, SUM(UNIDADES_ROTADAS) as unidades
+            FROM ventas WHERE UNIDAD='FARMACIAS' AND LOWER(GRUPOPDV) LIKE ?
+            GROUP BY POS ORDER BY ventas DESC
+        """, (f"%{grupo_decoded.lower()}%",))
+
     return jsonify([{
-        "pos": r["POS"],
-        "ventas": round(float(r["ventas"]),2),
-        "unidades": int(r["unidades"])
-    } for _, r in por_pos.iterrows()]), 200
+        "pos": r["pos_nombre"], "codigo": r["codigo"],
+        "ventas": round(r["ventas"], 2), "unidades": int(r["unidades"] or 0)
+    } for r in rows]), 200
+
 
 @app.route("/buscar_pos", methods=["GET"])
 def buscar_pos():
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not verificar_token(token):
+    if not auth_user():
         return jsonify({"error": "No autorizado"}), 401
-    
-    texto = request.args.get("q","").strip().lower()
+    texto = request.args.get("q", "").strip()
     if len(texto) < 2:
         return jsonify([]), 200
-    df = cargar_datos()
-    if df.empty:
-        return jsonify([]), 500
-    farm = df[df["UNIDAD"]=="FARMACIAS"]
-    todos_pos = farm["POS"].dropna().unique()
-    matches = [p for p in todos_pos if texto in str(p).lower()][:30]
-    ventas = farm[farm["POS"].isin(matches)].groupby("POS")["VENTA NETA RECUPERO"].sum()
-    resultado = sorted([{"pos": p, "ventas": round(float(ventas.get(p,0)),2)} for p in matches],
-                       key=lambda x: x["ventas"], reverse=True)
-    return jsonify(resultado), 200
+    rows = query("""
+        SELECT POS as pos, SUM("VENTA NETA RECUPERO") as ventas
+        FROM ventas WHERE UNIDAD='FARMACIAS' AND LOWER(POS) LIKE ?
+        GROUP BY POS ORDER BY ventas DESC LIMIT 30
+    """, (f"%{texto.lower()}%",))
+    return jsonify([{"pos": r["pos"], "ventas": round(r["ventas"], 2)} for r in rows]), 200
 
-@app.route("/detalle_pos", methods=["POST"])
+
+@app.route("/detalle_pos", methods=["POST", "OPTIONS"])
 def detalle_pos():
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not verificar_token(token):
+    if request.method == "OPTIONS":
+        return "", 204
+    if not auth_user():
         return jsonify({"error": "No autorizado"}), 401
-    
-    data = request.json
-    pos = data.get("pos","")
+
+    pos = (request.json or {}).get("pos", "")
     if not pos:
         return jsonify({"error": "POS requerido"}), 400
-    df = cargar_datos()
-    if df.empty:
-        return jsonify({"error": "Sin datos"}), 500
-    farm = df[df["UNIDAD"]=="FARMACIAS"]
-    datos_pos = farm[farm["POS"]==pos].copy()
-    if datos_pos.empty:
-        return jsonify({"error": f"No se encontró {pos}"}), 404
-    venta_total = float(datos_pos["VENTA NETA RECUPERO"].sum())
-    unidades = int(datos_pos["UNIDADES_ROTADAS"].sum())
-    grupo = datos_pos["GRUPOPDV"].iloc[0]
-    col_fecha = "DIA" if "DIA" in datos_pos.columns else "FECHA" if "FECHA" in datos_pos.columns else None
-    if col_fecha:
-        datos_pos["MES"] = datos_pos[col_fecha].astype(str).apply(parsear_mes_fecha)
-    else:
-        datos_pos["MES"] = "desconocido"
-    tend = datos_pos.groupby("MES")["VENTA NETA RECUPERO"].sum().to_dict()
-    tend = {k: round(float(v), 2) for k, v in tend.items()}
-    top_prods = datos_pos.groupby("PRODUCTO")["VENTA NETA RECUPERO"].sum().nlargest(5).to_dict()
-    top_prods = {k: round(float(v), 2) for k, v in top_prods.items()}
-    stock_info = obtener_stock_pos(pos, df)
-    venta_total_farm = float(farm["VENTA NETA RECUPERO"].sum())
-    pct = (venta_total / venta_total_farm * 100) if venta_total_farm > 0 else 0
+
+    info = query("SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY GRUPOPDV", (pos,), one=True)
+    if not info:
+        return jsonify({"error": f"No se encontro {pos}"}), 404
+
+    venta_total = info["vt"]
+    total_farm = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'")
+    pct = (venta_total / total_farm * 100) if total_farm > 0 else 0
+
+    # Tendencia mensual
+    tend_rows = query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,))
+    tend = {}
+    for r in tend_rows:
+        mes = parsear_mes(r["DIA"])
+        tend[mes] = round(tend.get(mes, 0) + r["v"], 2)
+
+    # Top productos
+    top = query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO ORDER BY v DESC LIMIT 5", (pos,))
+    top_prods = {r["PRODUCTO"]: round(r["v"], 2) for r in top}
+
+    # Stock SAP
+    stock_info = _get_stock_pos(pos)
+
     return jsonify({
         "pos": pos,
-        "grupo_pdv": grupo,
+        "grupo_pdv": info["GRUPOPDV"],
         "venta_total": round(venta_total, 2),
-        "unidades_rotadas": unidades,
+        "unidades_rotadas": int(info["ur"] or 0),
         "pct_del_total": round(pct, 2),
         "tendencia_mensual": tend,
         "top_5_productos": top_prods,
         "stock_info": stock_info
     }), 200
 
+
+def _get_stock_pos(pos):
+    """Stock desde tabla SAP"""
+    try:
+        rows = query("SELECT DIA, PRODUCTO, STOCK, IDNEPTUNO FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,))
+        if not rows:
+            return {"mensaje": "Sin registros en SAP"}
+
+        # Encontrar ultimo dia con stock
+        by_dia = {}
+        for r in rows:
+            dia = r["DIA"]
+            if dia not in by_dia:
+                by_dia[dia] = []
+            by_dia[dia].append(r)
+
+        dias_con_stock = {d: rr for d, rr in by_dia.items() if any(r["STOCK"] and r["STOCK"] > 0 for r in rr)}
+        if not dias_con_stock:
+            return {"mensaje": "Sin stock registrado"}
+
+        ultimo_dia = max(dias_con_stock.keys())
+        stock_dia = sorted(dias_con_stock[ultimo_dia], key=lambda x: x["STOCK"] or 0, reverse=True)
+
+        return {
+            "fecha": str(ultimo_dia),
+            "total_productos": len(stock_dia),
+            "detalle_stock": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia[:15]],
+            "sin_stock": [r["PRODUCTO"] for r in stock_dia if (r["STOCK"] or 0) == 0][:5],
+            "bajo_stock": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia if r["STOCK"] and 0 < r["STOCK"] <= 3][:5],
+            "con_stock_ok": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia if r["STOCK"] and r["STOCK"] > 3][:5]
+        }
+    except Exception as e:
+        return {"error": f"Error: {str(e)[:50]}"}
+
+
+@app.route("/productos_faltantes", methods=["POST", "OPTIONS"])
+def productos_faltantes():
+    if request.method == "OPTIONS":
+        return "", 204
+    if not auth_user():
+        return jsonify({"error": "No autorizado"}), 401
+
+    pos = (request.json or {}).get("pos", "")
+    if not pos:
+        return jsonify({"error": "POS requerido"}), 400
+
+    resultado = _calc_faltantes(pos)
+    return jsonify(resultado), 200
+
+
+def _calc_faltantes(pos):
+    """Top 5 productos faltantes con oportunidad"""
+    prods_farm = query("SELECT DISTINCT PRODUCTO FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,))
+    if not prods_farm:
+        return {"pos": pos, "error": f"No se encontro {pos}"}
+
+    productos_en = set(r["PRODUCTO"] for r in prods_farm)
+
+    ranking = query("""
+        SELECT PRODUCTO, MARCA,
+               SUM("VENTA NETA RECUPERO") as venta_total,
+               COUNT(DISTINCT POS) as num_farmacias,
+               SUM(UNIDADES_ROTADAS) as unidades_totales
+        FROM ventas WHERE UNIDAD='FARMACIAS'
+        GROUP BY PRODUCTO ORDER BY venta_total DESC
+    """)
+
+    total_farmacias = query_val("SELECT COUNT(DISTINCT POS) FROM ventas WHERE UNIDAD='FARMACIAS'")
+
+    faltantes = [r for r in ranking if r["PRODUCTO"] not in productos_en][:20]
+
+    resultado = []
+    for r in faltantes[:5]:
+        vta_prom = r["venta_total"] / r["num_farmacias"] if r["num_farmacias"] > 0 else 0
+        pen = (r["num_farmacias"] / total_farmacias * 100) if total_farmacias > 0 else 0
+        score = vta_prom * (r["num_farmacias"] / total_farmacias) if total_farmacias > 0 else 0
+        resultado.append({
+            "marca": r["MARCA"],
+            "producto": r["PRODUCTO"],
+            "venta_global_total": round(r["venta_total"], 2),
+            "venta_promedio_por_farmacia": round(vta_prom, 2),
+            "disponible_en_farmacias": r["num_farmacias"],
+            "penetracion_mercado": round(pen, 1),
+            "unidades_totales_vendidas": int(r["unidades_totales"] or 0),
+            "score_oportunidad": round(score, 2)
+        })
+
+    return {
+        "pos": pos,
+        "total_productos_faltantes": len(faltantes),
+        "top_5_productos_faltantes": resultado,
+        "productos_en_farmacia": len(productos_en),
+        "productos_globales": len(ranking),
+        "total_farmacias_red": total_farmacias
+    }
+
+
+# ══════════════════════════════════════════════════════════════
+# CHAT CON CLAUDE AI
+# ══════════════════════════════════════════════════════════════
+
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if request.method == "OPTIONS":
         return "", 204
-    
-    token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not verificar_token(token):
-        return jsonify({"error": "No autorizado. Inicia sesión primero."}), 401
-    
-    data = request.json
-    pregunta = data.get("pregunta","").strip()
+    if not auth_user():
+        return jsonify({"error": "No autorizado. Inicia sesion primero."}), 401
+
+    data = request.json or {}
+    pregunta = data.get("pregunta", "").strip()
     contexto_pos = data.get("contexto_pos", None)
-    
     if not pregunta:
-        return jsonify({"error": "Pregunta vacía"}), 400
-    
-    df = cargar_datos()
-    if df.empty:
-        return jsonify({"error": "Base de datos no cargada"}), 500
+        return jsonify({"error": "Pregunta vacia"}), 400
 
     if contexto_pos:
-        farm = df[df["UNIDAD"]=="FARMACIAS"]
-        datos_pos = farm[farm["POS"]==contexto_pos].copy()
-        if datos_pos.empty:
+        info = query("SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY GRUPOPDV", (contexto_pos,), one=True)
+        if not info:
             return jsonify({"error": f"Farmacia {contexto_pos} no encontrada"}), 404
-        venta_total = float(datos_pos["VENTA NETA RECUPERO"].sum())
-        col_fecha = "DIA" if "DIA" in datos_pos.columns else "FECHA" if "FECHA" in datos_pos.columns else None
-        if col_fecha:
-            datos_pos["MES"] = datos_pos[col_fecha].astype(str).apply(parsear_mes_fecha)
-        else:
-            datos_pos["MES"] = "desconocido"
-        tend = datos_pos.groupby("MES")["VENTA NETA RECUPERO"].sum().to_dict()
-        tend = {k: round(float(v), 2) for k, v in tend.items()}
-        top_prods = datos_pos.groupby("PRODUCTO")["VENTA NETA RECUPERO"].sum().nlargest(5).to_dict()
-        top_prods = {k: round(float(v), 2) for k, v in top_prods.items()}
-        stock_info = obtener_stock_pos(contexto_pos, df)
-        venta_total_farm = float(farm["VENTA NETA RECUPERO"].sum())
-        pct = (venta_total / venta_total_farm * 100) if venta_total_farm > 0 else 0
+
+        total_farm = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'")
+        pct = (info["vt"] / total_farm * 100) if total_farm else 0
+
+        tend_rows = query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,))
+        tend = {}
+        for r in tend_rows:
+            mes = parsear_mes(r["DIA"])
+            tend[mes] = round(tend.get(mes, 0) + r["v"], 2)
+
+        top = query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO ORDER BY v DESC LIMIT 5", (contexto_pos,))
+        stock = _get_stock_pos(contexto_pos)
+        faltantes = _calc_faltantes(contexto_pos).get("top_5_productos_faltantes", [])
+
         contexto = {
-            "pos": contexto_pos,
-            "grupo": datos_pos["GRUPOPDV"].iloc[0] if len(datos_pos) > 0 else "N/A",
-            "venta_total": round(venta_total, 2),
-            "pct_total": round(pct, 2),
+            "pos": contexto_pos, "grupo": info["GRUPOPDV"],
+            "venta_total": round(info["vt"], 2), "pct_total": round(pct, 2),
             "tendencia": tend,
-            "top_productos": top_prods,
-            "stock": stock_info
+            "top_productos": {r["PRODUCTO"]: round(r["v"], 2) for r in top},
+            "stock": stock,
+            "productos_faltantes_oportunidad": faltantes
         }
     else:
-        farm = df[df["UNIDAD"]=="FARMACIAS"]
-        dist = df[df["UNIDAD"]=="DISTRIBUCION DIFARE"]
+        vf = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'")
+        vd = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='DISTRIBUCION DIFARE'")
+        top_f = query("SELECT POS, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' GROUP BY POS ORDER BY v DESC LIMIT 5")
+        top_m = query("SELECT MARCA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD!='DIFARE S.A.' GROUP BY MARCA ORDER BY v DESC LIMIT 5")
         contexto = {
-            "venta_farmacias": round(float(farm["VENTA NETA RECUPERO"].sum()), 2),
-            "venta_distribucion": round(float(dist["VENTA NETA RECUPERO"].sum()), 2),
-            "top_farmacias": {k: round(float(v), 2) for k, v in farm.groupby("POS")["VENTA NETA RECUPERO"].sum().nlargest(5).to_dict().items()},
-            "top_marcas": {k: round(float(v), 2) for k, v in df[df["UNIDAD"]!="DIFARE S.A."].groupby("MARCA")["VENTA NETA RECUPERO"].sum().nlargest(5).to_dict().items()}
+            "venta_farmacias": round(vf or 0, 2),
+            "venta_distribucion": round(vd or 0, 2),
+            "top_farmacias": {r["POS"]: round(r["v"], 2) for r in top_f},
+            "top_marcas": {r["MARCA"]: round(r["v"], 2) for r in top_m}
         }
 
     prompt = f"""Eres el asistente comercial Difare Nexus de Genommalab Ecuador.
 Datos reales DIFARE Ecuador enero-marzo 2026.
-Responde conciso, ejecutivo, máximo 5 líneas. Usa emojis. Destaca números con **negrita**.
+Responde conciso, ejecutivo, maximo 5 lineas. Usa emojis. Destaca numeros con **negrita**.
 
 IMPORTANTE: Solo puedes responder sobre la farmacia actualmente seleccionada.
 Si el usuario pregunta por OTRA farmacia diferente, responde:
-"Para consultar otra farmacia, usa el botón 🏠 Inicio para seleccionarla."
+"Para consultar otra farmacia, usa el boton Inicio para seleccionarla."
 
-Farmacia actualmente seleccionada: {contexto.get('pos', 'GENERAL')}
-Datos disponibles: {contexto}
+Productos faltantes con oportunidad de venta (DATOS REALES):
+{contexto.get('productos_faltantes_oportunidad', 'No hay datos')}
+
+Farmacia seleccionada: {contexto.get('pos', 'GENERAL')}
+Datos: {contexto}
 Pregunta: {pregunta}
 
-Responde en español, práctico para vendedor en campo."""
+Responde en espanol, practico para vendedor en campo."""
 
     try:
         resp = client.messages.create(
-            model="claude-sonnet-4-5",
-            max_tokens=300,
-            messages=[{"role":"user","content":prompt}]
+            model="claude-sonnet-4-5", max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
         )
-        return jsonify({
-            "respuesta": resp.content[0].text,
-            "contexto_tipo": "farmacia" if contexto_pos else "general",
-            "timestamp": time.time()
-        }), 200
+        return jsonify({"respuesta": resp.content[0].text, "contexto_tipo": "farmacia" if contexto_pos else "general"}), 200
     except Exception as e:
-        return jsonify({
-            "error": f"Error Claude API: {str(e)[:100]}",
-            "respuesta": "Disculpa, hubo un error. Intenta de nuevo."
-        }), 500
+        return jsonify({"error": str(e)[:100], "respuesta": "Disculpa, hubo un error. Intenta de nuevo."}), 500
 
-# ── PARA VERCEL ──
+
+# ══════════════════════════════════════════════════════════════
+# FRONTEND
+# ══════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return Response(FRONTEND_HTML, mimetype="text/html")
+
+
 if __name__ == "__main__":
-    print("\n" + "="*60)
-    print("🚀 DIFARE NEXUS Chat Server v2 (CON AUTENTICACIÓN)")
-    print("="*60)
-    cargar_datos_async()
-    print("\n✅ Servidor listo")
-    print("="*60 + "\n")
+    print("=" * 50)
+    print("DIFARE NEXUS v3")
+    print("=" * 50)
+    try:
+        v = query_val("SELECT COUNT(*) FROM ventas")
+        s = query_val("SELECT COUNT(*) FROM sap")
+        print(f"DB: {v:,} ventas + {s:,} SAP")
+    except Exception as e:
+        print(f"DB Error: {e}")
+    print(f"Servidor: http://0.0.0.0:5000")
+    print("=" * 50)
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# FRONTEND HTML
+# ══════════════════════════════════════════════════════════════
+
+FRONTEND_HTML = r"""<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0a1628">
+<title>Difare Nexus</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --navy:#0a1628; --navy2:#111f38; --blue:#1B3A6B; --azure:#2E75B6;
+  --sky:#60A5FA; --gold:#C9A84C; --gold2:#F0C97A; --white:#F8FAFF;
+  --muted:#7a8fbb; --border:rgba(46,117,182,0.2); --green:#059669; --red:#DC2626;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{height:100%;-webkit-tap-highlight-color:transparent;}
+body{background:var(--navy);color:var(--white);font-family:'DM Sans',sans-serif;display:flex;flex-direction:column;}
+
+.login-screen{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;padding:24px;text-align:center;}
+.login-logo{font-family:'Playfair Display',serif;font-size:2rem;font-weight:900;color:var(--gold);margin-bottom:4px;}
+.login-sub{font-size:12px;color:var(--muted);margin-bottom:32px;}
+.login-form{width:100%;max-width:320px;display:flex;flex-direction:column;gap:12px;}
+.login-input{width:100%;background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:12px;padding:13px 16px;font-size:15px;color:var(--white);font-family:'DM Sans',sans-serif;outline:none;transition:border 0.2s;}
+.login-input:focus{border-color:var(--azure);}
+.login-input::placeholder{color:var(--muted);}
+.login-btn{width:100%;padding:14px;background:linear-gradient(135deg,var(--gold),var(--gold2));border:none;border-radius:12px;font-size:15px;font-weight:700;color:var(--navy);cursor:pointer;font-family:'DM Sans',sans-serif;transition:transform 0.2s;}
+.login-btn:hover{transform:scale(1.02);}
+.login-error{font-size:12px;color:var(--red);min-height:18px;}
+
+.header{background:var(--navy2);border-bottom:1px solid var(--border);padding:14px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;}
+.logo-icon{width:40px;height:40px;background:linear-gradient(135deg,var(--gold),var(--gold2));border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;color:var(--navy);}
+.logo-name{font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:var(--gold);}
+.logo-sub{font-size:11px;color:var(--muted);}
+.header-left{display:flex;align-items:center;gap:12px;}
+.header-right{display:flex;align-items:center;gap:10px;}
+.status{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--green);font-weight:500;}
+.status-dot{width:7px;height:7px;background:var(--green);border-radius:50%;animation:pulse 2s infinite;}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+.btn-logout{background:none;border:1px solid var(--border);color:var(--muted);padding:5px 10px;border-radius:8px;font-size:11px;cursor:pointer;font-family:'DM Sans',sans-serif;}
+.btn-logout:hover{border-color:var(--red);color:var(--red);}
+
+.content{flex:1;overflow-y:auto;padding:16px;-webkit-overflow-scrolling:touch;}
+.content::-webkit-scrollbar{width:4px;}
+.content::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px;}
+
+.panel{animation:slideUp 0.3s ease;}
+@keyframes slideUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.panel-title{font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:var(--gold);margin-bottom:6px;}
+.panel-sub{font-size:12px;color:var(--muted);margin-bottom:16px;}
+.btn-back{background:none;border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;font-size:12px;cursor:pointer;margin-bottom:16px;font-family:'DM Sans',sans-serif;transition:all 0.2s;}
+.btn-back:hover{border-color:var(--azure);color:var(--sky);}
+
+.grupos-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px;}
+.grupo-card{background:var(--navy2);border:1px solid var(--border);border-radius:12px;padding:14px;cursor:pointer;transition:all 0.2s;text-align:left;}
+.grupo-card:hover,.grupo-card:active{border-color:var(--azure);background:rgba(46,117,182,0.15);}
+.grupo-nombre{font-weight:600;font-size:13px;margin-bottom:3px;}
+.grupo-stats{font-size:11px;color:var(--muted);}
+
+.search-wrap{position:relative;margin-bottom:12px;}
+.search-input{width:100%;background:rgba(255,255,255,0.05);border:1px solid var(--border);border-radius:12px;padding:10px 16px 10px 38px;font-size:14px;color:var(--white);font-family:'DM Sans',sans-serif;outline:none;}
+.search-input:focus{border-color:var(--azure);}
+.search-input::placeholder{color:var(--muted);}
+.search-icon{position:absolute;left:12px;top:50%;transform:translateY(-50%);font-size:16px;pointer-events:none;}
+
+.farm-list{display:flex;flex-direction:column;gap:6px;}
+.farm-item{background:var(--navy2);border:1px solid var(--border);border-radius:10px;padding:11px 14px;cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:space-between;}
+.farm-item:hover,.farm-item:active{border-color:var(--gold);background:rgba(201,168,76,0.08);}
+.farm-nombre{font-size:13px;font-weight:500;}
+.farm-venta{font-size:12px;color:var(--gold);font-weight:600;}
+
+.chat-context{background:rgba(201,168,76,0.08);border:1px solid rgba(201,168,76,0.25);border-radius:12px;padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between;}
+.chat-context-name{font-size:13px;font-weight:600;color:var(--gold);}
+.chat-context-sub{font-size:11px;color:var(--muted);}
+.btn-cambiar{background:none;border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:8px;font-size:11px;cursor:pointer;font-family:'DM Sans',sans-serif;}
+.btn-cambiar:hover{border-color:var(--azure);color:var(--sky);}
+
+.messages{display:flex;flex-direction:column;gap:12px;}
+.msg{display:flex;gap:10px;align-items:flex-start;animation:slideUp 0.3s ease;}
+.msg.user{flex-direction:row-reverse;}
+.msg-avatar{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0;font-weight:700;color:var(--navy);}
+.msg.user .msg-avatar{background:var(--azure);color:white;}
+.msg.bot .msg-avatar{background:linear-gradient(135deg,var(--gold),var(--gold2));}
+.msg-bubble{max-width:85%;padding:10px 14px;border-radius:4px 14px 14px 14px;font-size:13px;line-height:1.65;}
+.msg.user .msg-bubble{background:var(--azure);color:white;border-radius:14px 4px 14px 14px;}
+.msg.bot .msg-bubble{background:var(--navy2);border:1px solid var(--border);color:var(--white);}
+.msg.bot .msg-bubble strong{color:var(--gold);}
+.msg-time{font-size:10px;color:var(--muted);margin-top:3px;text-align:right;}
+
+.typing{display:flex;gap:5px;align-items:center;padding:10px 14px;}
+.typing span{width:7px;height:7px;background:var(--muted);border-radius:50%;animation:typing 1.2s infinite;}
+.typing span:nth-child(2){animation-delay:0.2s;}
+.typing span:nth-child(3){animation-delay:0.4s;}
+@keyframes typing{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-8px)}}
+
+.quick-btns{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;}
+.quick-btn{background:var(--navy2);border:1px solid var(--border);border-radius:100px;padding:5px 12px;font-size:11px;color:var(--muted);cursor:pointer;transition:all 0.2s;font-family:'DM Sans',sans-serif;}
+.quick-btn:hover,.quick-btn:active{border-color:var(--azure);color:var(--sky);}
+
+.input-area{background:var(--navy2);border-top:1px solid var(--border);padding:12px 16px;flex-shrink:0;}
+.input-row{display:flex;gap:8px;align-items:flex-end;}
+.input-box{flex:1;background:rgba(255,255,255,0.05);border:1px solid var(--border);border-radius:12px;padding:10px 14px;font-size:14px;color:var(--white);font-family:'DM Sans',sans-serif;resize:none;outline:none;max-height:80px;line-height:1.5;}
+.input-box:focus{border-color:var(--azure);}
+.input-box::placeholder{color:var(--muted);}
+.send-btn{width:42px;height:42px;background:linear-gradient(135deg,var(--gold),var(--gold2));border:none;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;}
+.send-btn:disabled{opacity:0.4;cursor:not-allowed;}
+.loading{text-align:center;padding:20px;color:var(--muted);font-size:13px;}
+#appScreen{display:none;}
+</style>
+</head>
+<body>
+
+<div id="loginScreen" class="login-screen">
+  <div class="login-logo">Difare Nexus</div>
+  <div class="login-sub">Asistente Comercial IA</div>
+  <div class="login-form">
+    <input class="login-input" id="loginUser" placeholder="Usuario" autocomplete="username" autocapitalize="none">
+    <input class="login-input" id="loginPass" type="password" placeholder="Contrasena" autocomplete="current-password">
+    <button class="login-btn" onclick="hacerLogin()">Iniciar Sesion</button>
+    <div class="login-error" id="loginError"></div>
+  </div>
+</div>
+
+<div id="appScreen">
+  <div class="header">
+    <div class="header-left">
+      <div class="logo-icon">N</div>
+      <div><div class="logo-name">Difare Nexus</div><div class="logo-sub">Asistente Comercial</div></div>
+    </div>
+    <div class="header-right">
+      <div class="status"><div class="status-dot"></div><span id="userLabel">-</span></div>
+      <button class="btn-logout" onclick="cerrarSesion()">Salir</button>
+    </div>
+  </div>
+  <div class="content" id="content"><div class="loading">Cargando...</div></div>
+  <div class="input-area" id="inputArea" style="display:none;">
+    <div class="input-row">
+      <textarea class="input-box" id="inputBox" placeholder="Pregunta sobre esta farmacia..." rows="1"
+        onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      <button class="send-btn" id="sendBtn" onclick="enviarChat()">&#x27A4;</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const S=window.location.origin;
+let TK=localStorage.getItem("nx_tk")||null, US=localStorage.getItem("nx_us")||null;
+let posActual=null, esperando=false;
+
+function AH(){return{"Content-Type":"application/json","Authorization":"Bearer "+TK}}
+
+window.addEventListener("DOMContentLoaded",async()=>{
+  if(TK){try{const r=await fetch(S+"/verificar_token",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:TK})});const d=await r.json();if(d.valido){entrarApp();return;}}catch(e){}localStorage.removeItem("nx_tk");localStorage.removeItem("nx_us");TK=null;}
+  document.getElementById("loginScreen").style.display="flex";
+});
+
+async function hacerLogin(){
+  const u=document.getElementById("loginUser").value.trim();
+  const p=document.getElementById("loginPass").value.trim();
+  const err=document.getElementById("loginError");err.textContent="";
+  if(!u||!p){err.textContent="Ingresa usuario y contrasena";return;}
+  try{const r=await fetch(S+"/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({usuario:u,contrasena:p})});const d=await r.json();
+    if(d.exito){TK=d.token;US=d.usuario;localStorage.setItem("nx_tk",TK);localStorage.setItem("nx_us",US);entrarApp();}
+    else{err.textContent=d.error||"Error";}
+  }catch(e){err.textContent="No se pudo conectar";}
+}
+document.addEventListener("keydown",e=>{if(e.key==="Enter"&&document.getElementById("loginScreen").style.display!=="none")hacerLogin();});
+
+function entrarApp(){
+  document.getElementById("loginScreen").style.display="none";
+  const a=document.getElementById("appScreen");a.style.display="flex";a.style.flexDirection="column";a.style.height="100vh";
+  document.getElementById("userLabel").textContent=US;mostrarGrupos();
+}
+function cerrarSesion(){
+  fetch(S+"/logout",{method:"POST",headers:AH(),body:"{}"}).catch(()=>{});
+  localStorage.removeItem("nx_tk");localStorage.removeItem("nx_us");TK=null;US=null;
+  document.getElementById("appScreen").style.display="none";
+  document.getElementById("loginScreen").style.display="flex";
+  document.getElementById("loginUser").value="";document.getElementById("loginPass").value="";
+}
+
+async function mostrarGrupos(){
+  posActual=null;document.getElementById("inputArea").style.display="none";
+  const c=document.getElementById("content");c.innerHTML='<div class="loading">Cargando grupos...</div>';
+  try{const r=await fetch(S+"/grupos",{headers:AH()});if(r.status===401){cerrarSesion();return;}
+    const g=await r.json();const ic={"Cruz Azul Mostrador":"&#x1F3EA;","Cruz Azul Autoservicio":"&#x1F6D2;","Pharmacys":"&#x1F48A;","Dromayor":"&#x1F3EC;","Bodegas Internas Privadas":"&#x1F4E6;"};
+    c.innerHTML='<div class="panel"><div class="panel-title">Selecciona el grupo de farmacias</div><div class="panel-sub">Ordenados por venta Q1 2026</div><div class="grupos-grid">'+
+      g.map(x=>'<div class="grupo-card" onclick="mostrarFarmacias(\''+encodeURIComponent(x.grupo)+"','"+x.grupo.replace(/'/g,"\\'")+"')\">"+'<div style="font-size:20px;margin-bottom:6px">'+(ic[x.grupo]||"&#x1F3EA;")+'</div><div class="grupo-nombre">'+x.grupo+'</div><div class="grupo-stats">'+x.total_pos+' farmacias &middot; $'+(x.ventas/1000).toFixed(0)+'K</div></div>').join("")+'</div></div>';
+  }catch(e){c.innerHTML='<div class="loading">No se pudo conectar al servidor.</div>';}
+}
+
+async function mostrarFarmacias(ge,gn){
+  const c=document.getElementById("content");c.innerHTML='<div class="loading">Cargando farmacias...</div>';
+  try{const r=await fetch(S+"/farmacias/"+ge,{headers:AH()});if(r.status===401){cerrarSesion();return;}
+    const f=await r.json();window._f=f;
+    c.innerHTML='<div class="panel"><button class="btn-back" onclick="mostrarGrupos()">&#8592; Cambiar grupo</button><div class="panel-title">Farmacias de '+gn+'</div><div class="panel-sub">'+f.length+' farmacias</div><div class="search-wrap"><span class="search-icon">&#128269;</span><input class="search-input" id="si" placeholder="Buscar farmacia..." oninput="filtF(this.value)"></div><div class="farm-list" id="fl">'+renF(f)+'</div></div>';
+  }catch(e){c.innerHTML='<div class="loading">Error al cargar.</div>';}
+}
+function renF(f){return f.slice(0,40).map(x=>'<div class="farm-item" onclick="selPos(\''+x.pos.replace(/'/g,"\\'")+"')\">"+'<div class="farm-nombre">'+x.pos+'</div><div class="farm-venta">$'+Math.round(x.ventas).toLocaleString("es-EC")+'</div></div>').join("");}
+function filtF(t){if(!window._f)return;document.getElementById("fl").innerHTML=renF(window._f.filter(x=>x.pos.toLowerCase().includes(t.toLowerCase())));}
+
+async function selPos(pos){
+  posActual=pos;const c=document.getElementById("content");c.innerHTML='<div class="loading">Cargando datos...</div>';
+  try{const r=await fetch(S+"/detalle_pos",{method:"POST",headers:AH(),body:JSON.stringify({pos})});
+    if(r.status===401){cerrarSesion();return;}const d=await r.json();
+    const si=d.stock_info||{},ss=(si.sin_stock||[]).slice(0,3),bs=(si.bajo_stock||[]).slice(0,3);
+    c.innerHTML='<div class="panel"><div id="sb" style="position:sticky;top:0;z-index:10;background:var(--navy);padding-bottom:10px;"><div class="chat-context"><div><div class="chat-context-name">'+pos+'</div><div class="chat-context-sub">'+d.grupo_pdv+' &middot; $'+d.venta_total.toLocaleString("es-EC")+' Q1 &middot; '+d.pct_del_total+'%</div></div><button class="btn-cambiar" onclick="mostrarGrupos()">Cambiar</button></div><div class="quick-btns"><button class="quick-btn" onclick="mostrarGrupos()" style="border-color:rgba(201,168,76,0.3);color:var(--gold)">Inicio</button><button class="quick-btn" onclick="qr(\'Tendencia de ventas mes a mes\')">Tendencia</button><button class="quick-btn" onclick="qr(\'Que productos debo ofrecer hoy\')">Que ofrecer</button><button class="quick-btn" onclick="qr(\'Oportunidad de crecimiento\')">Oportunidad</button><button class="quick-btn" onclick="qr(\'Stock en unidades top 8 productos\')">Stock</button></div></div><div class="messages" id="msgs"><div class="msg bot"><div class="msg-avatar">N</div><div><div class="msg-bubble">Hola! Estoy listo para ayudarte con <strong>'+pos+'</strong>.<br><br>Venta Q1: <strong>$'+d.venta_total.toLocaleString("es-EC")+'</strong> ('+d.pct_del_total+'% del total)<br>'+(ss.length?'Sin stock: <strong>'+ss.join(", ")+'</strong><br>':'OK stock<br>')+(bs.length?'Stock bajo: <strong>'+bs.map(b=>(b.PRODUCTO||"?").split(" ").slice(0,3).join(" ")+": "+b.STOCK+"u").join(" | ")+'</strong><br>':'')+'<br>Que quieres saber?</div><div class="msg-time">'+gN()+'</div></div></div></div></div>';
+    document.getElementById("inputArea").style.display="block";document.getElementById("inputBox").focus();
+  }catch(e){c.innerHTML='<div class="loading">Error al cargar.</div>';}
+}
+function qr(t){document.getElementById("inputBox").value=t;enviarChat();}
+
+function gN(){return new Date().toLocaleTimeString("es-EC",{hour:"2-digit",minute:"2-digit"});}
+function autoResize(el){el.style.height="auto";el.style.height=Math.min(el.scrollHeight,80)+"px";}
+function handleKey(e){if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();enviarChat();}}
+
+function addMsg(t,tp){const m=document.getElementById("msgs");if(!m)return;const d=document.createElement("div");d.className="msg "+tp;d.innerHTML='<div class="msg-avatar">'+(tp==="user"?"U":"N")+'</div><div><div class="msg-bubble">'+t.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>").replace(/\n/g,"<br>")+'</div><div class="msg-time">'+gN()+'</div></div>';m.appendChild(d);document.getElementById("content").scrollTop=99999;}
+function showTy(){const m=document.getElementById("msgs");if(!m)return;const d=document.createElement("div");d.className="msg bot";d.id="ty";d.innerHTML='<div class="msg-avatar">N</div><div class="msg-bubble"><div class="typing"><span></span><span></span><span></span></div></div>';m.appendChild(d);document.getElementById("content").scrollTop=99999;}
+function hideTy(){const t=document.getElementById("ty");if(t)t.remove();}
+
+async function enviarChat(){
+  if(esperando||!posActual)return;const inp=document.getElementById("inputBox");const q=inp.value.trim();if(!q)return;
+  addMsg(q,"user");inp.value="";inp.style.height="auto";esperando=true;document.getElementById("sendBtn").disabled=true;showTy();
+  try{const r=await fetch(S+"/chat",{method:"POST",headers:AH(),body:JSON.stringify({pregunta:q,contexto_pos:posActual})});
+    if(r.status===401){cerrarSesion();return;}const d=await r.json();hideTy();addMsg(d.respuesta||d.error,"bot");
+  }catch(e){hideTy();addMsg("Error de conexion.","bot");}
+  esperando=false;document.getElementById("sendBtn").disabled=false;document.getElementById("inputBox").focus();
+}
+</script>
+</body>
+</html>"""
