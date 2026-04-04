@@ -32,7 +32,11 @@ def get_anthropic_client():
 # ── CONFIG ──
 JWT_SECRET = os.getenv("JWT_SECRET", "difare-nexus-secret-cambiar-en-produccion")
 JWT_EXPIRY = 86400
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+# data.db está en la raíz del proyecto (un nivel arriba de api/)
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data.db")
+# Fallback: buscar en el mismo directorio
+if not os.path.exists(DB_PATH):
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
 # ── USUARIOS ──
 def _hash(pw):
