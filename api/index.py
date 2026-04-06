@@ -289,6 +289,19 @@ def buscar_pos():
     return jsonify([{"pos": r["pos"], "ventas": round(r["ventas"], 2)} for r in rows]), 200
 
 
+def _resolver_filtro_pos(pos_nombre):
+    """Devuelve (filtro_sql, param_tupla) para filtrar por farmacia.
+    Prefiere CODIGOPDV (identificador estable del PDV); cae a POS por nombre
+    como fallback. Esto evita perder data cuando el cliente envia el mismo PDV
+    con variaciones menores en el nombre entre archivos mensuales/semanales."""
+    r = query("SELECT CODIGOPDV FROM ventas WHERE POS=? AND CODIGOPDV IS NOT NULL AND CODIGOPDV!='' LIMIT 1", (pos_nombre,), one=True)
+    if not (r and r["CODIGOPDV"]):
+        r = query("SELECT CODIGOPDV FROM sap WHERE POS=? AND CODIGOPDV IS NOT NULL AND CODIGOPDV!='' LIMIT 1", (pos_nombre,), one=True)
+    if r and r["CODIGOPDV"] not in (None, ""):
+        return "CODIGOPDV=?", (str(r["CODIGOPDV"]),)
+    return "POS=?", (pos_nombre,)
+
+
 @app.route("/detalle_pos", methods=["POST", "OPTIONS"])
 def detalle_pos():
     if request.method == "OPTIONS":
@@ -300,18 +313,20 @@ def detalle_pos():
     if not pos:
         return jsonify({"error": "POS requerido"}), 400
 
-    info = query("SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY GRUPOPDV", (pos,), one=True)
+    flt, p = _resolver_filtro_pos(pos)
+
+    info = query(f"SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY GRUPOPDV", p, one=True)
     if not info:
         return jsonify({"error": f"No se encontro {pos}"}), 404
 
     # Meses de ventas (mensual oficial) — tienen precedencia sobre sap (semanal)
     meses_ventas_pos = set(str(r["m"]) for r in query(
-        "SELECT DISTINCT substr(DIA,1,6) as m FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,)))
+        f"SELECT DISTINCT substr(DIA,1,6) as m FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt}", p))
 
     # Sumar ventas adicionales desde sap excluyendo meses que ya estan en ventas
     extra_vt_sum = 0.0
     extra_ur_sum = 0.0
-    for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
+    for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM sap WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY DIA", p):
         dia = str(r["DIA"])
         mes6 = dia[:4] + dia[5:7] if "/" in dia else dia[:6]
         if mes6 in meses_ventas_pos:
@@ -330,11 +345,11 @@ def detalle_pos():
     tend = {}
     dias_con_data = {}  # mes -> set(dias YYYYMMDD)
     meses_en_ventas = set()
-    for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
+    for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY DIA", p):
         mes = parsear_mes(r["DIA"])
         tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
         meses_en_ventas.add(mes)
-    for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
+    for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY DIA", p):
         mes = parsear_mes(r["DIA"])
         # Precedencia: si el mes ya existe en ventas (mensual oficial), ignorar el semanal
         if mes in meses_en_ventas:
@@ -371,9 +386,9 @@ def detalle_pos():
 
     # Top productos (ventas + sap excluyendo meses con precedencia)
     top_map = {}
-    for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (pos,)):
+    for r in query(f"SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY PRODUCTO", p):
         top_map[r["PRODUCTO"]] = top_map.get(r["PRODUCTO"], 0) + (r["v"] or 0)
-    for r in query("SELECT PRODUCTO, DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO, DIA", (pos,)):
+    for r in query(f"SELECT PRODUCTO, DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND {flt} GROUP BY PRODUCTO, DIA", p):
         dia = str(r["DIA"])
         mes6 = dia[:4] + dia[5:7] if "/" in dia else dia[:6]
         if mes6 in meses_ventas_pos:
@@ -382,7 +397,7 @@ def detalle_pos():
     top_prods = {k: round(v, 2) for k, v in sorted(top_map.items(), key=lambda x: x[1], reverse=True)[:5]}
 
     # Stock SAP
-    stock_info = _get_stock_pos(pos)
+    stock_info = _get_stock_pos(pos, flt=flt, p=p)
 
     return jsonify({
         "pos": pos,
@@ -398,21 +413,26 @@ def detalle_pos():
     }), 200
 
 
-def _get_stock_pos(pos):
+def _get_stock_pos(pos, flt=None, p=None):
     """Stock desde tabla SAP — devuelve tabla completa de items codificados"""
+    if flt is None or p is None:
+        flt, p = _resolver_filtro_pos(pos)
+    # Adaptamos el filtro para el JOIN (usa alias s.)
+    flt_s = flt.replace("CODIGOPDV=?", "s.CODIGOPDV=?").replace("POS=?", "s.POS=?")
+    flt_inner = flt  # dentro del subquery sin alias
     try:
         # Ultimo DIA por producto (tomar la foto mas reciente disponible por cada item)
-        rows = query("""
+        rows = query(f"""
             SELECT s.PRODUCTO, s.IDNEPTUNO, s.STOCK, s.STOCK_VALORIZADO, s.DIA
             FROM sap s
             INNER JOIN (
                 SELECT IDNEPTUNO, MAX(DIA) as max_dia
-                FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?
+                FROM sap WHERE UNIDAD='FARMACIAS' AND {flt_inner}
                 GROUP BY IDNEPTUNO
             ) ult ON ult.IDNEPTUNO = s.IDNEPTUNO AND ult.max_dia = s.DIA
-            WHERE s.UNIDAD='FARMACIAS' AND s.POS=?
+            WHERE s.UNIDAD='FARMACIAS' AND {flt_s}
             ORDER BY s.STOCK_VALORIZADO DESC, s.STOCK DESC
-        """, (pos, pos))
+        """, p + p)
 
         if not rows:
             return {"mensaje": "Sin registros en SAP", "detalle_completo": []}
@@ -525,7 +545,8 @@ def productos_faltantes():
 
 def _calc_faltantes(pos):
     """Top 5 productos faltantes con oportunidad"""
-    prods_farm = query("SELECT DISTINCT PRODUCTO FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,))
+    flt, p = _resolver_filtro_pos(pos)
+    prods_farm = query(f"SELECT DISTINCT PRODUCTO FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt}", p)
     if not prods_farm:
         return {"pos": pos, "error": f"No se encontro {pos}"}
 
@@ -588,18 +609,19 @@ def chat():
         return jsonify({"error": "Pregunta vacia"}), 400
 
     if contexto_pos:
-        info = query("SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY GRUPOPDV", (contexto_pos,), one=True)
+        flt_c, p_c = _resolver_filtro_pos(contexto_pos)
+        info = query(f"SELECT GRUPOPDV, SUM(\"VENTA NETA RECUPERO\") as vt FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY GRUPOPDV", p_c, one=True)
         if not info:
             return jsonify({"error": f"Farmacia {contexto_pos} no encontrada"}), 404
 
         meses_v_ctx = set(str(r["m"]) for r in query(
-            "SELECT DISTINCT substr(DIA,1,6) as m FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=?", (contexto_pos,)))
+            f"SELECT DISTINCT substr(DIA,1,6) as m FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt_c}", p_c))
         def _mes6(d):
             d = str(d)
             return d[:4] + d[5:7] if "/" in d else d[:6]
 
         extra_vt = 0.0
-        for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as vt FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,)):
+        for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as vt FROM sap WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY DIA", p_c):
             if _mes6(r["DIA"]) in meses_v_ctx: continue
             extra_vt += (r["vt"] or 0)
         venta_total_ctx = (info["vt"] or 0) + extra_vt
@@ -608,18 +630,18 @@ def chat():
         pct = (venta_total_ctx / total_farm * 100) if total_farm else 0
 
         tend = {}
-        for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,)):
+        for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY DIA", p_c):
             mes = parsear_mes(r["DIA"])
             tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
-        for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,)):
+        for r in query(f"SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY DIA", p_c):
             if _mes6(r["DIA"]) in meses_v_ctx: continue
             mes = parsear_mes(r["DIA"])
             tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
 
         top_map_c = {}
-        for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (contexto_pos,)):
+        for r in query(f"SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY PRODUCTO", p_c):
             top_map_c[r["PRODUCTO"]] = top_map_c.get(r["PRODUCTO"], 0) + (r["v"] or 0)
-        for r in query("SELECT PRODUCTO, DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO, DIA", (contexto_pos,)):
+        for r in query(f"SELECT PRODUCTO, DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND {flt_c} GROUP BY PRODUCTO, DIA", p_c):
             if _mes6(r["DIA"]) in meses_v_ctx: continue
             top_map_c[r["PRODUCTO"]] = top_map_c.get(r["PRODUCTO"], 0) + (r["v"] or 0)
         top = [{"PRODUCTO": k, "v": v} for k, v in sorted(top_map_c.items(), key=lambda x: x[1], reverse=True)[:5]]
