@@ -33,11 +33,11 @@ def get_anthropic_client():
 # ── CONFIG ──
 JWT_SECRET = os.getenv("JWT_SECRET", "difare-nexus-secret-cambiar-en-produccion")
 JWT_EXPIRY = 86400
-# data.db está en la raíz del proyecto (un nivel arriba de api/)
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data.db")
-# Fallback: buscar en el mismo directorio
+# data.db debe vivir DENTRO de api/ para que Vercel lo incluya en el bundle
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+# Fallback para desarrollo local (raíz del proyecto)
 if not os.path.exists(DB_PATH):
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+    DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data.db")
 
 # ── USUARIOS ──
 def _hash(pw):
@@ -160,6 +160,26 @@ def verificar_token_endpoint():
 @app.route("/logout", methods=["POST"])
 def logout():
     return jsonify({"exito": True, "mensaje": "Sesion cerrada"}), 200
+
+@app.route("/debug_db", methods=["GET"])
+def debug_db():
+    import glob
+    base = os.path.dirname(os.path.abspath(__file__))
+    parent = os.path.dirname(base)
+    info = {
+        "db_path": DB_PATH,
+        "exists": os.path.exists(DB_PATH),
+        "size": os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0,
+        "files_api": [os.path.basename(f) + ":" + str(os.path.getsize(f)) for f in glob.glob(base + "/*")],
+        "files_root": [os.path.basename(f) + ":" + str(os.path.getsize(f)) for f in glob.glob(parent + "/*") if os.path.isfile(f)][:30],
+    }
+    try:
+        tables = [r["name"] for r in query("SELECT name FROM sqlite_master WHERE type='table'")]
+        info["tables"] = tables
+    except Exception as e:
+        info["tables_error"] = str(e)[:200]
+    return jsonify(info), 200
+
 
 @app.route("/health", methods=["GET"])
 def health():
