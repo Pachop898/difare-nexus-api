@@ -121,12 +121,12 @@ def parsear_mes(dia_str):
         parts = s.split("/")
         if len(parts) == 3 and len(parts[0]) == 4:
             return f"{parts[0]}-{parts[1]}"
-    if len(s) >= 7:
-        return s[:7]
-    if len(s) == 6 and s.isdigit():
-        return s[:4] + "-" + s[4:6]
     if len(s) == 8 and s.isdigit():
         return s[:4] + "-" + s[4:6]
+    if len(s) == 6 and s.isdigit():
+        return s[:4] + "-" + s[4:6]
+    if len(s) >= 7:
+        return s[:7]
     return "desconocido"
 
 
@@ -304,16 +304,24 @@ def detalle_pos():
     if not info:
         return jsonify({"error": f"No se encontro {pos}"}), 404
 
-    venta_total = info["vt"]
-    total_farm = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'")
+    # Sumar ventas de marzo desde sap (mismo POS, UNIDAD FARMACIAS)
+    extra = query("SELECT SUM(\"VENTA NETA RECUPERO\") as vt, SUM(UNIDADES_ROTADAS) as ur FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,), one=True)
+    vt_extra = (extra["vt"] or 0) if extra else 0
+    ur_extra = (extra["ur"] or 0) if extra else 0
+
+    venta_total = (info["vt"] or 0) + vt_extra
+    total_farm = (query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'") or 0) \
+               + (query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM sap WHERE UNIDAD='FARMACIAS'") or 0)
     pct = (venta_total / total_farm * 100) if total_farm > 0 else 0
 
-    # Tendencia mensual
-    tend_rows = query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,))
+    # Tendencia mensual (ventas Ene/Feb + sap Mar)
     tend = {}
-    for r in tend_rows:
+    for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
         mes = parsear_mes(r["DIA"])
-        tend[mes] = round(tend.get(mes, 0) + r["v"], 2)
+        tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
+    for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
+        mes = parsear_mes(r["DIA"])
+        tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
 
     # Ordenar por mes y agregar etiqueta corta
     tend_ord = []
@@ -324,9 +332,13 @@ def detalle_pos():
 
     proyeccion = _calc_proyeccion(tend_ord)
 
-    # Top productos
-    top = query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO ORDER BY v DESC LIMIT 5", (pos,))
-    top_prods = {r["PRODUCTO"]: round(r["v"], 2) for r in top}
+    # Top productos (ventas + sap)
+    top_map = {}
+    for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (pos,)):
+        top_map[r["PRODUCTO"]] = top_map.get(r["PRODUCTO"], 0) + (r["v"] or 0)
+    for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (pos,)):
+        top_map[r["PRODUCTO"]] = top_map.get(r["PRODUCTO"], 0) + (r["v"] or 0)
+    top_prods = {k: round(v, 2) for k, v in sorted(top_map.items(), key=lambda x: x[1], reverse=True)[:5]}
 
     # Stock SAP
     stock_info = _get_stock_pos(pos)
@@ -335,7 +347,7 @@ def detalle_pos():
         "pos": pos,
         "grupo_pdv": info["GRUPOPDV"],
         "venta_total": round(venta_total, 2),
-        "unidades_rotadas": int(info["ur"] or 0),
+        "unidades_rotadas": int((info["ur"] or 0) + ur_extra),
         "pct_del_total": round(pct, 2),
         "tendencia_mensual": tend,
         "tendencia_ordenada": tend_ord,
@@ -510,22 +522,32 @@ def chat():
         if not info:
             return jsonify({"error": f"Farmacia {contexto_pos} no encontrada"}), 404
 
-        total_farm = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'")
-        pct = (info["vt"] / total_farm * 100) if total_farm else 0
+        extra_vt = query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?", (contexto_pos,)) or 0
+        venta_total_ctx = (info["vt"] or 0) + extra_vt
+        total_farm = (query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM ventas WHERE UNIDAD='FARMACIAS'") or 0) \
+                   + (query_val("SELECT SUM(\"VENTA NETA RECUPERO\") FROM sap WHERE UNIDAD='FARMACIAS'") or 0)
+        pct = (venta_total_ctx / total_farm * 100) if total_farm else 0
 
-        tend_rows = query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,))
         tend = {}
-        for r in tend_rows:
+        for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,)):
             mes = parsear_mes(r["DIA"])
-            tend[mes] = round(tend.get(mes, 0) + r["v"], 2)
+            tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
+        for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (contexto_pos,)):
+            mes = parsear_mes(r["DIA"])
+            tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
 
-        top = query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO ORDER BY v DESC LIMIT 5", (contexto_pos,))
+        top_map_c = {}
+        for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (contexto_pos,)):
+            top_map_c[r["PRODUCTO"]] = top_map_c.get(r["PRODUCTO"], 0) + (r["v"] or 0)
+        for r in query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO", (contexto_pos,)):
+            top_map_c[r["PRODUCTO"]] = top_map_c.get(r["PRODUCTO"], 0) + (r["v"] or 0)
+        top = [{"PRODUCTO": k, "v": v} for k, v in sorted(top_map_c.items(), key=lambda x: x[1], reverse=True)[:5]]
         stock = _get_stock_pos(contexto_pos)
         faltantes = _calc_faltantes(contexto_pos).get("top_5_productos_faltantes", [])
 
         contexto = {
             "pos": contexto_pos, "grupo": info["GRUPOPDV"],
-            "venta_total": round(info["vt"], 2), "pct_total": round(pct, 2),
+            "venta_total": round(venta_total_ctx, 2), "pct_total": round(pct, 2),
             "tendencia": tend,
             "top_productos": {r["PRODUCTO"]: round(r["v"], 2) for r in top},
             "stock": stock,
