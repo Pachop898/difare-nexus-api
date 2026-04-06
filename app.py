@@ -452,14 +452,39 @@ def _get_stock_pos(pos):
 
 
 def _calc_proyeccion(tend_ord):
-    """Proyeccion del proximo mes. Usa valores prorrateados para meses parciales."""
+    """Proyeccion del MES EN CURSO (cierre). Si el ultimo mes es parcial,
+    proyecta su cierre con formula lineal: valor / dias_data * dias_mes.
+    Si el ultimo mes ya esta completo, proyecta el proximo mes con crecimiento promedio."""
     if not tend_ord:
         return None
-    # Valor efectivo: prorrateado si el mes es parcial
+    last = tend_ord[-1]
+    # Caso principal: mes en curso parcial -> proyeccion lineal del cierre
+    if last.get("parcial"):
+        valor_real = last["valor"]
+        dias_data = last.get("dias_con_data", 0)
+        dias_mes = last.get("dias_mes", 30)
+        if dias_data > 0:
+            proy = valor_real / dias_data * dias_mes
+        else:
+            proy = valor_real
+        # % vs mes anterior (para ver si cierra mejor o peor)
+        pct_vs_prev = None
+        if len(tend_ord) >= 2:
+            prev = tend_ord[-2]["valor"]
+            if prev > 0:
+                pct_vs_prev = round((proy - prev) / prev * 100, 1)
+        return {
+            "valor": round(proy, 2),
+            "label": "Proy. " + last["label"],
+            "mes_en_curso": True,
+            "crecimiento_pct": pct_vs_prev,
+            "metodo": f"lineal {round(valor_real,2)}/{dias_data}*{dias_mes}"
+        }
+    # Fallback: todos los meses completos -> proyectar proximo mes con crecimiento
     def _vef(e):
         return e.get("valor_prorrateado", e["valor"])
     if len(tend_ord) == 1:
-        return {"valor": round(_vef(tend_ord[0]), 2), "metodo": "ultimo mes"}
+        return {"valor": round(_vef(tend_ord[0]), 2), "label": "Proy.", "metodo": "ultimo mes"}
     crec = []
     for i in range(1, len(tend_ord)):
         prev = _vef(tend_ord[i-1])
@@ -468,11 +493,12 @@ def _calc_proyeccion(tend_ord):
             crec.append((cur - prev) / prev)
     base = _vef(tend_ord[-1])
     if not crec:
-        return {"valor": round(base, 2), "metodo": "ultimo mes"}
+        return {"valor": round(base, 2), "label": "Proy.", "metodo": "ultimo mes"}
     avg = sum(crec) / len(crec)
     proy = base * (1 + avg)
     return {
         "valor": round(proy, 2),
+        "label": "Proy.",
         "crecimiento_pct": round(avg * 100, 1),
         "metodo": f"crecimiento promedio {round(avg*100,1)}%"
     }
@@ -896,7 +922,7 @@ function showTendencia(){
   if(!tend.length){addMsg("Sin datos de tendencia disponibles.","bot");return;}
   // Construir barras (datos reales + proyeccion)
   const bars=tend.map(x=>({label:x.label,valor:x.valor,full:x.parcial?x.valor_prorrateado:x.valor,parcial:!!x.parcial,dias:x.dias_con_data,diasMes:x.dias_mes,proy:false}));
-  if(proy&&proy.valor){bars.push({label:"Proy.",valor:proy.valor,full:proy.valor,parcial:false,proy:true});}
+  if(proy&&proy.valor){bars.push({label:proy.label||"Proy.",valor:proy.valor,full:proy.valor,parcial:false,proy:true});}
   const maxV=Math.max(...bars.map(b=>b.full||b.valor))||1;
   const W=300,H=170,PAD=28,BW=Math.floor((W-PAD*2)/bars.length*0.7),GAP=Math.floor((W-PAD*2)/bars.length*0.3);
   let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;max-width:340px;height:auto;display:block;">';
@@ -930,7 +956,8 @@ function showTendencia(){
   });
   if(proy&&proy.valor){
     const pctS=proy.crecimiento_pct!==undefined?(proy.crecimiento_pct>=0?"+":"")+proy.crecimiento_pct+"%":"";
-    txt+='<br>Proyeccion proximo mes: <strong>$'+proy.valor.toLocaleString("es-EC")+'</strong> '+pctS;
+    const proyTit=proy.mes_en_curso?('Proyeccion cierre '+(proy.label||'').replace('Proy. ','')):'Proyeccion proximo mes';
+    txt+='<br>'+proyTit+': <strong>$'+proy.valor.toLocaleString("es-EC")+'</strong> '+pctS;
   }
   const hayParc=tend.some(x=>x.parcial);
   if(hayParc){txt+='<br><em style="color:#8ea0b6;font-size:11px">* Cierre estimado prorrateado por dias con data.</em>';}
