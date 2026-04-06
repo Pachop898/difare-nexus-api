@@ -316,19 +316,39 @@ def detalle_pos():
 
     # Tendencia mensual (ventas Ene/Feb + sap Mar)
     tend = {}
+    dias_con_data = {}  # mes -> set(dias YYYYMMDD)
     for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
         mes = parsear_mes(r["DIA"])
         tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
     for r in query("SELECT DIA, SUM(\"VENTA NETA RECUPERO\") as v FROM sap WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY DIA", (pos,)):
         mes = parsear_mes(r["DIA"])
         tend[mes] = round(tend.get(mes, 0) + (r["v"] or 0), 2)
+        dias_con_data.setdefault(mes, set()).add(str(r["DIA"]))
 
-    # Ordenar por mes y agregar etiqueta corta
+    import calendar
+    def _dias_en_mes(mes_key):
+        try:
+            y, m = mes_key.split("-") if "-" in mes_key else (mes_key[:4], mes_key[4:6])
+            return calendar.monthrange(int(y), int(m))[1]
+        except Exception:
+            return 30
+
+    # Ordenar por mes y agregar etiqueta corta + prorrateo si el mes esta incompleto
     tend_ord = []
     for mes_key in sorted(tend.keys()):
         mm = mes_key[-2:] if "-" in mes_key else mes_key[4:6] if len(mes_key) >= 6 else ""
         label = MESES_ES.get(mm, mes_key)
-        tend_ord.append({"mes": mes_key, "label": label, "valor": tend[mes_key]})
+        valor = tend[mes_key]
+        dias_data = len(dias_con_data.get(mes_key, set()))
+        dias_tot = _dias_en_mes(mes_key)
+        entry = {"mes": mes_key, "label": label, "valor": valor,
+                 "dias_con_data": dias_data, "dias_mes": dias_tot, "parcial": False}
+        # Prorratear si tenemos datos diarios y el mes esta incompleto
+        if 0 < dias_data < dias_tot:
+            entry["valor_real"] = valor
+            entry["valor_prorrateado"] = round(valor / dias_data * dias_tot, 2)
+            entry["parcial"] = True
+        tend_ord.append(entry)
 
     proyeccion = _calc_proyeccion(tend_ord)
 
@@ -411,26 +431,29 @@ def _get_stock_pos(pos):
 
 
 def _calc_proyeccion(tend_ord):
-    """Calcula proyeccion del siguiente mes basado en tendencia (ultimo mes o promedio de crecimiento)"""
-    if not tend_ord or len(tend_ord) == 0:
+    """Proyeccion del proximo mes. Usa valores prorrateados para meses parciales."""
+    if not tend_ord:
         return None
+    # Valor efectivo: prorrateado si el mes es parcial
+    def _vef(e):
+        return e.get("valor_prorrateado", e["valor"])
     if len(tend_ord) == 1:
-        return {"mes": "proyeccion", "valor": tend_ord[0]["valor"], "metodo": "ultimo mes"}
-    # Crecimiento promedio mes a mes
+        return {"valor": round(_vef(tend_ord[0]), 2), "metodo": "ultimo mes"}
     crec = []
     for i in range(1, len(tend_ord)):
-        prev = tend_ord[i-1]["valor"]
-        cur = tend_ord[i]["valor"]
+        prev = _vef(tend_ord[i-1])
+        cur = _vef(tend_ord[i])
         if prev > 0:
             crec.append((cur - prev) / prev)
+    base = _vef(tend_ord[-1])
     if not crec:
-        return {"mes": "proyeccion", "valor": round(tend_ord[-1]["valor"], 2), "metodo": "ultimo mes"}
+        return {"valor": round(base, 2), "metodo": "ultimo mes"}
     avg = sum(crec) / len(crec)
-    proy = tend_ord[-1]["valor"] * (1 + avg)
+    proy = base * (1 + avg)
     return {
         "valor": round(proy, 2),
         "crecimiento_pct": round(avg * 100, 1),
-        "metodo": f"proyeccion segun crecimiento promedio {round(avg*100,1)}%"
+        "metodo": f"crecimiento promedio {round(avg*100,1)}%"
     }
 
 
@@ -840,29 +863,45 @@ function showTendencia(){
   const tend=d.tendencia_ordenada||[];const proy=d.proyeccion_proximo_mes;
   if(!tend.length){addMsg("Sin datos de tendencia disponibles.","bot");return;}
   // Construir barras (datos reales + proyeccion)
-  const bars=tend.map(x=>({label:x.label,valor:x.valor,proy:false}));
-  if(proy&&proy.valor){bars.push({label:"Proy.",valor:proy.valor,proy:true});}
-  const maxV=Math.max(...bars.map(b=>b.valor))||1;
-  const W=280,H=160,PAD=28,BW=Math.floor((W-PAD*2)/bars.length*0.7),GAP=Math.floor((W-PAD*2)/bars.length*0.3);
-  let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;max-width:320px;height:auto;display:block;">';
+  const bars=tend.map(x=>({label:x.label,valor:x.valor,full:x.parcial?x.valor_prorrateado:x.valor,parcial:!!x.parcial,dias:x.dias_con_data,diasMes:x.dias_mes,proy:false}));
+  if(proy&&proy.valor){bars.push({label:"Proy.",valor:proy.valor,full:proy.valor,parcial:false,proy:true});}
+  const maxV=Math.max(...bars.map(b=>b.full||b.valor))||1;
+  const W=300,H=170,PAD=28,BW=Math.floor((W-PAD*2)/bars.length*0.7),GAP=Math.floor((W-PAD*2)/bars.length*0.3);
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;max-width:340px;height:auto;display:block;">';
+  svg+='<defs><linearGradient id="pg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#C9A84C" stop-opacity="0.6"/><stop offset="1" stop-color="#C9A84C" stop-opacity="0.2"/></linearGradient><pattern id="hatch" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" fill="#C9A84C" fill-opacity="0.25"/><line x1="0" y1="0" x2="0" y2="4" stroke="#C9A84C" stroke-width="1.2"/></pattern></defs>';
   svg+='<line x1="'+PAD+'" y1="'+(H-PAD)+'" x2="'+(W-PAD/2)+'" y2="'+(H-PAD)+'" stroke="#37516e" stroke-width="1"/>';
   bars.forEach((b,i)=>{
-    const bh=(b.valor/maxV)*(H-PAD*2);
-    const x=PAD+i*(BW+GAP);const y=H-PAD-bh;
-    const fill=b.proy?"url(#pg)":"#C9A84C";
-    svg+='<rect x="'+x+'" y="'+y+'" width="'+BW+'" height="'+bh+'" fill="'+fill+'" rx="3"/>';
-    svg+='<text x="'+(x+BW/2)+'" y="'+(y-4)+'" fill="#e8edf3" font-size="9" text-anchor="middle">$'+Math.round(b.valor)+'</text>';
-    svg+='<text x="'+(x+BW/2)+'" y="'+(H-PAD+12)+'" fill="#8ea0b6" font-size="10" text-anchor="middle">'+b.label+'</text>';
+    const baseY=H-PAD;
+    const bhFull=((b.full||b.valor)/maxV)*(H-PAD*2);
+    const bhReal=(b.valor/maxV)*(H-PAD*2);
+    const x=PAD+i*(BW+GAP);
+    if(b.parcial){
+      // Rectangulo completo con hatch (cierre proyectado) + rectangulo solido con valor real
+      svg+='<rect x="'+x+'" y="'+(baseY-bhFull)+'" width="'+BW+'" height="'+bhFull+'" fill="url(#hatch)" stroke="#C9A84C" stroke-dasharray="2,2" stroke-width="0.8" rx="3"/>';
+      svg+='<rect x="'+x+'" y="'+(baseY-bhReal)+'" width="'+BW+'" height="'+bhReal+'" fill="#C9A84C" rx="3"/>';
+      svg+='<text x="'+(x+BW/2)+'" y="'+(baseY-bhFull-4)+'" fill="#C9A84C" font-size="9" text-anchor="middle">$'+Math.round(b.full)+'*</text>';
+    }else{
+      const fill=b.proy?"url(#pg)":"#C9A84C";
+      svg+='<rect x="'+x+'" y="'+(baseY-bhFull)+'" width="'+BW+'" height="'+bhFull+'" fill="'+fill+'" rx="3"/>';
+      svg+='<text x="'+(x+BW/2)+'" y="'+(baseY-bhFull-4)+'" fill="#e8edf3" font-size="9" text-anchor="middle">$'+Math.round(b.valor)+'</text>';
+    }
+    svg+='<text x="'+(x+BW/2)+'" y="'+(baseY+12)+'" fill="#8ea0b6" font-size="10" text-anchor="middle">'+b.label+'</text>';
   });
-  svg+='<defs><linearGradient id="pg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#C9A84C" stop-opacity="0.6"/><stop offset="1" stop-color="#C9A84C" stop-opacity="0.2"/></linearGradient></defs>';
   svg+='</svg>';
   let txt='<strong>Tendencia '+d.pos+'</strong><br>';
-  tend.forEach(x=>{txt+=x.label+' 2026: <strong>$'+x.valor.toLocaleString("es-EC")+'</strong><br>';});
+  tend.forEach(x=>{
+    if(x.parcial){
+      txt+=x.label+' 2026: <strong>$'+x.valor.toLocaleString("es-EC")+'</strong> <span style="color:#8ea0b6;font-size:11px">('+x.dias_con_data+'/'+x.dias_mes+' dias &middot; cierre est. $'+x.valor_prorrateado.toLocaleString("es-EC")+')</span><br>';
+    }else{
+      txt+=x.label+' 2026: <strong>$'+x.valor.toLocaleString("es-EC")+'</strong><br>';
+    }
+  });
   if(proy&&proy.valor){
     const pctS=proy.crecimiento_pct!==undefined?(proy.crecimiento_pct>=0?"+":"")+proy.crecimiento_pct+"%":"";
     txt+='<br>Proyeccion proximo mes: <strong>$'+proy.valor.toLocaleString("es-EC")+'</strong> '+pctS;
   }
-  if(tend.length<3){txt+='<br><br><em style="color:#8ea0b6">Solo hay datos hasta '+tend[tend.length-1].label+'. Actualiza los Excels de ventas para ver marzo.</em>';}
+  const hayParc=tend.some(x=>x.parcial);
+  if(hayParc){txt+='<br><em style="color:#8ea0b6;font-size:11px">* Cierre estimado prorrateado por dias con data.</em>';}
   addMsg(svg+txt,"bot");
 }
 
