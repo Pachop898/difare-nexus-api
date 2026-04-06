@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import base64
+from urllib.parse import unquote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -209,18 +210,23 @@ def get_grupos():
     return jsonify(resultado), 200
 
 
-@app.route("/farmacias/<grupo>", methods=["GET"])
-def get_farmacias_por_grupo(grupo):
+@app.route("/farmacias", methods=["GET"])
+@app.route("/farmacias/<path:grupo>", methods=["GET"])
+def get_farmacias_por_grupo(grupo=None):
     if not auth_user():
         return jsonify({"error": "No autorizado"}), 401
 
-    grupo_decoded = grupo.replace("_", " ")
+    # Aceptamos grupo via query param o path (mas robusto ante URL encoding)
+    if not grupo:
+        grupo = request.args.get("grupo", "")
+    grupo_decoded = unquote(grupo).replace("_", " ").strip()
+
     mapeo_inv = {
-        "Cruz Azul Mostrador": ("cafi mostrador", "cafa mostrador", "cofa mostrador"),
-        "Cruz Azul Autoservicio": ("cafi autoservicio", "cafa autoservicio"),
+        "cruz azul mostrador": ("cafi mostrador", "cafa mostrador", "cofa mostrador"),
+        "cruz azul autoservicio": ("cafi autoservicio", "cafa autoservicio"),
     }
 
-    grupos = mapeo_inv.get(grupo_decoded, (grupo_decoded.lower(),))
+    grupos = mapeo_inv.get(grupo_decoded.lower(), (grupo_decoded.lower(),))
     placeholders = ",".join(["?" for _ in grupos])
 
     rows = query(f"""
@@ -289,6 +295,15 @@ def detalle_pos():
         mes = parsear_mes(r["DIA"])
         tend[mes] = round(tend.get(mes, 0) + r["v"], 2)
 
+    # Ordenar por mes y agregar etiqueta corta
+    tend_ord = []
+    for mes_key in sorted(tend.keys()):
+        mm = mes_key[-2:] if "-" in mes_key else mes_key[4:6] if len(mes_key) >= 6 else ""
+        label = MESES_ES.get(mm, mes_key)
+        tend_ord.append({"mes": mes_key, "label": label, "valor": tend[mes_key]})
+
+    proyeccion = _calc_proyeccion(tend_ord)
+
     # Top productos
     top = query("SELECT PRODUCTO, SUM(\"VENTA NETA RECUPERO\") as v FROM ventas WHERE UNIDAD='FARMACIAS' AND POS=? GROUP BY PRODUCTO ORDER BY v DESC LIMIT 5", (pos,))
     top_prods = {r["PRODUCTO"]: round(r["v"], 2) for r in top}
@@ -303,43 +318,92 @@ def detalle_pos():
         "unidades_rotadas": int(info["ur"] or 0),
         "pct_del_total": round(pct, 2),
         "tendencia_mensual": tend,
+        "tendencia_ordenada": tend_ord,
+        "proyeccion_proximo_mes": proyeccion,
         "top_5_productos": top_prods,
         "stock_info": stock_info
     }), 200
 
 
 def _get_stock_pos(pos):
-    """Stock desde tabla SAP"""
+    """Stock desde tabla SAP — devuelve tabla completa de items codificados"""
     try:
-        rows = query("SELECT DIA, PRODUCTO, STOCK, IDNEPTUNO FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?", (pos,))
+        # Ultimo DIA por producto (tomar la foto mas reciente disponible por cada item)
+        rows = query("""
+            SELECT s.PRODUCTO, s.IDNEPTUNO, s.STOCK, s.STOCK_VALORIZADO, s.DIA
+            FROM sap s
+            INNER JOIN (
+                SELECT IDNEPTUNO, MAX(DIA) as max_dia
+                FROM sap WHERE UNIDAD='FARMACIAS' AND POS=?
+                GROUP BY IDNEPTUNO
+            ) ult ON ult.IDNEPTUNO = s.IDNEPTUNO AND ult.max_dia = s.DIA
+            WHERE s.UNIDAD='FARMACIAS' AND s.POS=?
+            ORDER BY s.STOCK_VALORIZADO DESC, s.STOCK DESC
+        """, (pos, pos))
+
         if not rows:
-            return {"mensaje": "Sin registros en SAP"}
+            return {"mensaje": "Sin registros en SAP", "detalle_completo": []}
 
-        # Encontrar ultimo dia con stock
-        by_dia = {}
-        for r in rows:
-            dia = r["DIA"]
-            if dia not in by_dia:
-                by_dia[dia] = []
-            by_dia[dia].append(r)
+        ultimo_dia = max((r["DIA"] for r in rows), default="")
+        total_unid = sum((r["STOCK"] or 0) for r in rows)
+        total_val = sum((r["STOCK_VALORIZADO"] or 0) for r in rows)
 
-        dias_con_stock = {d: rr for d, rr in by_dia.items() if any(r["STOCK"] and r["STOCK"] > 0 for r in rr)}
-        if not dias_con_stock:
-            return {"mensaje": "Sin stock registrado"}
+        detalle = [{
+            "producto": r["PRODUCTO"],
+            "id_neptuno": r["IDNEPTUNO"],
+            "stock_unid": float(r["STOCK"] or 0),
+            "stock_val": round(float(r["STOCK_VALORIZADO"] or 0), 2),
+            "dia": str(r["DIA"])
+        } for r in rows]
 
-        ultimo_dia = max(dias_con_stock.keys())
-        stock_dia = sorted(dias_con_stock[ultimo_dia], key=lambda x: x["STOCK"] or 0, reverse=True)
+        con_stock = [d for d in detalle if d["stock_unid"] > 0]
+        sin_stock = [d for d in detalle if d["stock_unid"] == 0]
+        bajo = [d for d in con_stock if 0 < d["stock_unid"] <= 3]
 
         return {
             "fecha": str(ultimo_dia),
-            "total_productos": len(stock_dia),
-            "detalle_stock": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia[:15]],
-            "sin_stock": [r["PRODUCTO"] for r in stock_dia if (r["STOCK"] or 0) == 0][:5],
-            "bajo_stock": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia if r["STOCK"] and 0 < r["STOCK"] <= 3][:5],
-            "con_stock_ok": [{"PRODUCTO": r["PRODUCTO"], "STOCK": r["STOCK"]} for r in stock_dia if r["STOCK"] and r["STOCK"] > 3][:5]
+            "total_productos": len(detalle),
+            "total_con_stock": len(con_stock),
+            "total_sin_stock": len(sin_stock),
+            "total_unidades": round(total_unid, 0),
+            "total_valorizado": round(total_val, 2),
+            "detalle_completo": detalle,
+            "sin_stock": [d["producto"] for d in sin_stock][:8],
+            "bajo_stock": [{"PRODUCTO": d["producto"], "STOCK": d["stock_unid"]} for d in bajo][:8],
+            # Retrocompat
+            "detalle_stock": [{"PRODUCTO": d["producto"], "STOCK": d["stock_unid"]} for d in con_stock[:15]],
+            "con_stock_ok": [{"PRODUCTO": d["producto"], "STOCK": d["stock_unid"]} for d in con_stock if d["stock_unid"] > 3][:5]
         }
     except Exception as e:
-        return {"error": f"Error: {str(e)[:50]}"}
+        return {"error": f"Error: {str(e)[:80]}", "detalle_completo": []}
+
+
+def _calc_proyeccion(tend_ord):
+    """Calcula proyeccion del siguiente mes basado en tendencia (ultimo mes o promedio de crecimiento)"""
+    if not tend_ord or len(tend_ord) == 0:
+        return None
+    if len(tend_ord) == 1:
+        return {"mes": "proyeccion", "valor": tend_ord[0]["valor"], "metodo": "ultimo mes"}
+    # Crecimiento promedio mes a mes
+    crec = []
+    for i in range(1, len(tend_ord)):
+        prev = tend_ord[i-1]["valor"]
+        cur = tend_ord[i]["valor"]
+        if prev > 0:
+            crec.append((cur - prev) / prev)
+    if not crec:
+        return {"mes": "proyeccion", "valor": round(tend_ord[-1]["valor"], 2), "metodo": "ultimo mes"}
+    avg = sum(crec) / len(crec)
+    proy = tend_ord[-1]["valor"] * (1 + avg)
+    return {
+        "valor": round(proy, 2),
+        "crecimiento_pct": round(avg * 100, 1),
+        "metodo": f"proyeccion segun crecimiento promedio {round(avg*100,1)}%"
+    }
+
+
+MESES_ES = {"01":"Ene","02":"Feb","03":"Mar","04":"Abr","05":"May","06":"Jun",
+            "07":"Jul","08":"Ago","09":"Sep","10":"Oct","11":"Nov","12":"Dic"}
 
 
 @app.route("/productos_faltantes", methods=["POST", "OPTIONS"])
@@ -708,7 +772,7 @@ async function mostrarGrupos(){
 
 async function mostrarFarmacias(ge,gn){
   const c=document.getElementById("content");c.innerHTML='<div class="loading">Cargando farmacias...</div>';
-  try{const r=await fetch(S+"/farmacias/"+ge,{headers:AH()});if(r.status===401){cerrarSesion();return;}
+  try{const r=await fetch(S+"/farmacias?grupo="+ge,{headers:AH()});if(r.status===401){cerrarSesion();return;}
     const f=await r.json();window._f=f;
     c.innerHTML='<div class="panel"><button class="btn-back" onclick="mostrarGrupos()">&#8592; Cambiar grupo</button><div class="panel-title">Farmacias de '+gn+'</div><div class="panel-sub">'+f.length+' farmacias</div><div class="search-wrap"><span class="search-icon">&#128269;</span><input class="search-input" id="si" placeholder="Buscar farmacia..." oninput="filtF(this.value)"></div><div class="farm-list" id="fl">'+renF(f)+'</div></div>';
   }catch(e){c.innerHTML='<div class="loading">Error al cargar.</div>';}
@@ -719,13 +783,64 @@ function filtF(t){if(!window._f)return;document.getElementById("fl").innerHTML=r
 async function selPos(pos){
   posActual=pos;const c=document.getElementById("content");c.innerHTML='<div class="loading">Cargando datos...</div>';
   try{const r=await fetch(S+"/detalle_pos",{method:"POST",headers:AH(),body:JSON.stringify({pos})});
-    if(r.status===401){cerrarSesion();return;}const d=await r.json();
+    if(r.status===401){cerrarSesion();return;}const d=await r.json();window._detalle=d;
     const si=d.stock_info||{},ss=(si.sin_stock||[]).slice(0,3),bs=(si.bajo_stock||[]).slice(0,3);
-    c.innerHTML='<div class="panel"><div id="sb" style="position:sticky;top:0;z-index:10;background:var(--navy);padding-bottom:10px;"><div class="chat-context"><div><div class="chat-context-name">'+pos+'</div><div class="chat-context-sub">'+d.grupo_pdv+' &middot; $'+d.venta_total.toLocaleString("es-EC")+' Q1 &middot; '+d.pct_del_total+'%</div></div><button class="btn-cambiar" onclick="mostrarGrupos()">Cambiar</button></div><div class="quick-btns"><button class="quick-btn" onclick="mostrarGrupos()" style="border-color:rgba(201,168,76,0.3);color:var(--gold)">Inicio</button><button class="quick-btn" onclick="qr(\'Tendencia de ventas mes a mes\')">Tendencia</button><button class="quick-btn" onclick="qr(\'Que productos debo ofrecer hoy\')">Que ofrecer</button><button class="quick-btn" onclick="qr(\'Oportunidad de crecimiento\')">Oportunidad</button><button class="quick-btn" onclick="qr(\'Stock en unidades top 8 productos\')">Stock</button></div></div><div class="messages" id="msgs"><div class="msg bot"><div class="msg-avatar">N</div><div><div class="msg-bubble">Hola! Estoy listo para ayudarte con <strong>'+pos+'</strong>.<br><br>Venta Q1: <strong>$'+d.venta_total.toLocaleString("es-EC")+'</strong> ('+d.pct_del_total+'% del total)<br>'+(ss.length?'Sin stock: <strong>'+ss.join(", ")+'</strong><br>':'OK stock<br>')+(bs.length?'Stock bajo: <strong>'+bs.map(b=>(b.PRODUCTO||"?").split(" ").slice(0,3).join(" ")+": "+b.STOCK+"u").join(" | ")+'</strong><br>':'')+'<br>Que quieres saber?</div><div class="msg-time">'+gN()+'</div></div></div></div></div>';
+    c.innerHTML='<div class="panel"><div id="sb" style="position:sticky;top:0;z-index:10;background:var(--navy);padding-bottom:10px;"><div class="chat-context"><div><div class="chat-context-name">'+pos+'</div><div class="chat-context-sub">'+d.grupo_pdv+' &middot; $'+d.venta_total.toLocaleString("es-EC")+' Q1 &middot; '+d.pct_del_total+'%</div></div><button class="btn-cambiar" onclick="mostrarGrupos()">Cambiar</button></div><div class="quick-btns"><button class="quick-btn" onclick="mostrarGrupos()" style="border-color:rgba(201,168,76,0.3);color:var(--gold)">Inicio</button><button class="quick-btn" onclick="showTendencia()">Tendencia</button><button class="quick-btn" onclick="qr(\'Que productos debo ofrecer hoy\')">Que ofrecer</button><button class="quick-btn" onclick="qr(\'Oportunidad de crecimiento\')">Oportunidad</button><button class="quick-btn" onclick="showStock()">Stock</button></div></div><div class="messages" id="msgs"><div class="msg bot"><div class="msg-avatar">N</div><div><div class="msg-bubble">Hola! Estoy listo para ayudarte con <strong>'+pos+'</strong>.<br><br>Venta Q1: <strong>$'+d.venta_total.toLocaleString("es-EC")+'</strong> ('+d.pct_del_total+'% del total)<br>'+(ss.length?'Sin stock: <strong>'+ss.join(", ")+'</strong><br>':'OK stock<br>')+(bs.length?'Stock bajo: <strong>'+bs.map(b=>(b.PRODUCTO||"?").split(" ").slice(0,3).join(" ")+": "+b.STOCK+"u").join(" | ")+'</strong><br>':'')+'<br>Que quieres saber?</div><div class="msg-time">'+gN()+'</div></div></div></div></div>';
     document.getElementById("inputArea").style.display="block";document.getElementById("inputBox").focus();
   }catch(e){c.innerHTML='<div class="loading">Error al cargar.</div>';}
 }
 function qr(t){document.getElementById("inputBox").value=t;enviarChat();}
+
+function showTendencia(){
+  const d=window._detalle;if(!d)return;
+  const tend=d.tendencia_ordenada||[];const proy=d.proyeccion_proximo_mes;
+  if(!tend.length){addMsg("Sin datos de tendencia disponibles.","bot");return;}
+  // Construir barras (datos reales + proyeccion)
+  const bars=tend.map(x=>({label:x.label,valor:x.valor,proy:false}));
+  if(proy&&proy.valor){bars.push({label:"Proy.",valor:proy.valor,proy:true});}
+  const maxV=Math.max(...bars.map(b=>b.valor))||1;
+  const W=280,H=160,PAD=28,BW=Math.floor((W-PAD*2)/bars.length*0.7),GAP=Math.floor((W-PAD*2)/bars.length*0.3);
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;max-width:320px;height:auto;display:block;">';
+  svg+='<line x1="'+PAD+'" y1="'+(H-PAD)+'" x2="'+(W-PAD/2)+'" y2="'+(H-PAD)+'" stroke="#37516e" stroke-width="1"/>';
+  bars.forEach((b,i)=>{
+    const bh=(b.valor/maxV)*(H-PAD*2);
+    const x=PAD+i*(BW+GAP);const y=H-PAD-bh;
+    const fill=b.proy?"url(#pg)":"#C9A84C";
+    svg+='<rect x="'+x+'" y="'+y+'" width="'+BW+'" height="'+bh+'" fill="'+fill+'" rx="3"/>';
+    svg+='<text x="'+(x+BW/2)+'" y="'+(y-4)+'" fill="#e8edf3" font-size="9" text-anchor="middle">$'+Math.round(b.valor)+'</text>';
+    svg+='<text x="'+(x+BW/2)+'" y="'+(H-PAD+12)+'" fill="#8ea0b6" font-size="10" text-anchor="middle">'+b.label+'</text>';
+  });
+  svg+='<defs><linearGradient id="pg" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#C9A84C" stop-opacity="0.6"/><stop offset="1" stop-color="#C9A84C" stop-opacity="0.2"/></linearGradient></defs>';
+  svg+='</svg>';
+  let txt='<strong>Tendencia '+d.pos+'</strong><br>';
+  tend.forEach(x=>{txt+=x.label+' 2026: <strong>$'+x.valor.toLocaleString("es-EC")+'</strong><br>';});
+  if(proy&&proy.valor){
+    const pctS=proy.crecimiento_pct!==undefined?(proy.crecimiento_pct>=0?"+":"")+proy.crecimiento_pct+"%":"";
+    txt+='<br>Proyeccion proximo mes: <strong>$'+proy.valor.toLocaleString("es-EC")+'</strong> '+pctS;
+  }
+  if(tend.length<3){txt+='<br><br><em style="color:#8ea0b6">Solo hay datos hasta '+tend[tend.length-1].label+'. Actualiza los Excels de ventas para ver marzo.</em>';}
+  addMsg(svg+txt,"bot");
+}
+
+function showStock(){
+  const d=window._detalle;if(!d)return;
+  const si=d.stock_info||{};const det=si.detalle_completo||[];
+  if(!det.length){addMsg("Sin registros de stock disponibles.","bot");return;}
+  const conStock=det.filter(x=>x.stock_unid>0);
+  let html='<strong>Stock '+d.pos+'</strong>';
+  if(si.fecha){const f=si.fecha;html+='<br><span style="color:#8ea0b6;font-size:11px">Corte: '+f.slice(6,8)+'/'+f.slice(4,6)+'/'+f.slice(0,4)+'</span>';}
+  html+='<br><br>Items codificados: <strong>'+si.total_productos+'</strong> &middot; Con stock: <strong>'+si.total_con_stock+'</strong>';
+  html+='<br>Total unidades: <strong>'+Math.round(si.total_unidades||0).toLocaleString("es-EC")+'</strong>';
+  html+='<br>Valorizado: <strong>$'+(si.total_valorizado||0).toLocaleString("es-EC")+'</strong><br><br>';
+  html+='<div style="overflow-x:auto;-webkit-overflow-scrolling:touch"><table style="width:100%;border-collapse:collapse;font-size:11px;"><thead><tr style="background:rgba(46,117,182,0.15);color:#C9A84C"><th style="text-align:left;padding:6px 4px;border-bottom:1px solid #37516e">Producto</th><th style="text-align:right;padding:6px 4px;border-bottom:1px solid #37516e">Unid.</th><th style="text-align:right;padding:6px 4px;border-bottom:1px solid #37516e">Valor $</th></tr></thead><tbody>';
+  det.forEach(x=>{
+    const zero=x.stock_unid===0;
+    const color=zero?"color:#8ea0b6":(x.stock_unid<=3?"color:#f0a84c":"color:#e8edf3");
+    html+='<tr style="'+color+'"><td style="padding:4px;border-bottom:1px solid rgba(55,81,110,0.4)">'+x.producto+'</td><td style="text-align:right;padding:4px;border-bottom:1px solid rgba(55,81,110,0.4)">'+x.stock_unid+'</td><td style="text-align:right;padding:4px;border-bottom:1px solid rgba(55,81,110,0.4)">$'+x.stock_val.toLocaleString("es-EC")+'</td></tr>';
+  });
+  html+='</tbody></table></div>';
+  addMsg(html,"bot");
+}
 
 function gN(){return new Date().toLocaleTimeString("es-EC",{hour:"2-digit",minute:"2-digit"});}
 function autoResize(el){el.style.height="auto";el.style.height=Math.min(el.scrollHeight,80)+"px";}
